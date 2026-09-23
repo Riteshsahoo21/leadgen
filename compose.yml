@@ -113,7 +113,7 @@ services:
       context: .
       dockerfile: apps/web/Dockerfile
     healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://localhost/healthz"]
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1/healthz"]
       interval: 15s
       timeout: 3s
       retries: 5
@@ -190,7 +190,7 @@ services:
       - ollama_data:/root/.ollama
     healthcheck:
       test: ["CMD", "ollama", "list"]
-      interval: 15s
+      interval: 60s
       timeout: 5s
       retries: 10
     restart: unless-stopped
