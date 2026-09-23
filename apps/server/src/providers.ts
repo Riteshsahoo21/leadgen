@@ -193,9 +193,12 @@ export async function qualifyBusiness(candidate: BusinessCandidate, evidence?: R
   });
   const baseline = Math.min(98, 42 + (candidate.phone ? 10 : 0) + ((candidate.reviewCount ?? 0) > 30 ? 14 : 0)
     + (!candidate.website ? 24 : 8) + (!evidence?.has_booking ? 6 : 0));
-  if (config.PROVIDER_MODE === 'safe') return {
+  const ruleResult = {
     qualified: baseline >= config.MIN_QUALIFICATION_SCORE, score: baseline, ...fallback,
-    recommendedRole: 'Owner', rationale: 'Deterministic safe-mode qualification using stored evidence.', model: 'rules-safe-mode',
+    recommendedRole: 'Owner', rationale: 'Evidence-based qualification using deterministic scoring.', model: 'rules-live-fallback',
+  };
+  if (config.PROVIDER_MODE === 'safe') return {
+    ...ruleResult, rationale: 'Deterministic safe-mode qualification using stored evidence.', model: 'rules-safe-mode',
   };
 
   const schema = {
@@ -206,24 +209,45 @@ export async function qualifyBusiness(candidate: BusinessCandidate, evidence?: R
       recommended_role: { type: 'string' }, rationale: { type: 'string' },
     },
   };
-  const response = await fetch(`${config.OLLAMA_URL}/api/chat`, {
-    method: 'POST', headers: { 'content-type': 'application/json' }, signal: AbortSignal.timeout(120_000),
-    body: JSON.stringify({ model: config.OLLAMA_MODEL, stream: false, format: schema, keep_alive: 0,
-      options: { temperature: 0.1, num_ctx: 4096 }, messages: [
-        { role: 'system', content: 'Qualify only from supplied evidence. Never invent facts. Return strict JSON.' },
-        { role: 'user', content: JSON.stringify({ company: candidate, websiteEvidence: evidence ?? null }) },
-      ] }),
-  });
-  if (!response.ok) throw new Error(`Ollama error ${response.status}`);
-  const data = await response.json() as { message?: { content?: string } };
-  const parsed = JSON.parse(data.message?.content ?? '{}') as Record<string, unknown>;
-  const score = Math.max(0, Math.min(100, Number(parsed.score ?? 0)));
-  return {
-    qualified: Boolean(parsed.qualified) && score >= config.MIN_QUALIFICATION_SCORE, score,
-    opportunity: String(parsed.opportunity ?? fallback.opportunity),
-    painPoints: Array.isArray(parsed.pain_points) ? parsed.pain_points.map(String).slice(0, 5) : fallback.painPoints,
-    recommendedRole: String(parsed.recommended_role ?? 'Owner'), rationale: String(parsed.rationale ?? ''), model: config.OLLAMA_MODEL,
+  const compactEvidence = evidence ? {
+    title: evidence.title,
+    description: evidence.description,
+    about: String(evidence.about ?? '').slice(0, 800),
+    services: evidence.services,
+    hasContactForm: evidence.has_contact_form,
+    hasBooking: evidence.has_booking,
+    hasPayment: evidence.has_payment,
+    pagesCrawled: evidence.pages_crawled,
+    textSample: String(evidence.text_sample ?? '').slice(0, 1_800),
+  } : null;
+  const compactCompany = {
+    name: candidate.name, category: candidate.category, categories: candidate.categories,
+    country: candidate.country, city: candidate.city, hasPhone: Boolean(candidate.phone),
+    hasWebsite: Boolean(candidate.website), rating: candidate.rating, reviewCount: candidate.reviewCount,
   };
+  try {
+    const response = await fetch(`${config.OLLAMA_URL}/api/chat`, {
+      method: 'POST', headers: { 'content-type': 'application/json' }, signal: AbortSignal.timeout(300_000),
+      body: JSON.stringify({ model: config.OLLAMA_MODEL, stream: false, think: false, format: schema, keep_alive: 0,
+        options: { temperature: 0.1, num_ctx: 2048, num_predict: 256 }, messages: [
+          { role: 'system', content: 'Qualify only from supplied evidence. Never invent facts. Return concise strict JSON.' },
+          { role: 'user', content: JSON.stringify({ company: compactCompany, websiteEvidence: compactEvidence }) },
+        ] }),
+    });
+    if (!response.ok) throw new Error(`Ollama error ${response.status}`);
+    const data = await response.json() as { message?: { content?: string } };
+    const parsed = JSON.parse(data.message?.content ?? '{}') as Record<string, unknown>;
+    const score = Math.max(0, Math.min(100, Number(parsed.score ?? 0)));
+    return {
+      qualified: Boolean(parsed.qualified) && score >= config.MIN_QUALIFICATION_SCORE, score,
+      opportunity: String(parsed.opportunity ?? fallback.opportunity),
+      painPoints: Array.isArray(parsed.pain_points) ? parsed.pain_points.map(String).slice(0, 5) : fallback.painPoints,
+      recommendedRole: String(parsed.recommended_role ?? 'Owner'), rationale: String(parsed.rationale ?? ''), model: config.OLLAMA_MODEL,
+    };
+  } catch (error) {
+    console.warn(`Ollama qualification unavailable for ${candidate.name}; using rule fallback:`, error instanceof Error ? error.message : error);
+    return ruleResult;
+  }
 }
 
 export async function findDecisionMaker(candidate: BusinessCandidate, role = 'Owner') {
