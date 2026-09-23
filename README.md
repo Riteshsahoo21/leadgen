@@ -31,7 +31,7 @@ The four arguments are the dashboard host, Posta host, Posta administrator email
 ./scripts/bootstrap.sh 203.0.113.10 203.0.113.10 admin@example.com hello@example.com
 ```
 
-This exposes the dashboard at `http://203.0.113.10` and Posta at `http://203.0.113.10:9000`. IP mode deliberately uses plain HTTP and must not be used for real email sending. Add domains before enabling live campaigns so Caddy can issue trusted certificates and email DNS can be configured.
+This exposes only the dashboard at `http://203.0.113.10`. Posta remains private in IP mode because its administrator login must not travel over plain HTTP. Add domains before configuring Posta or enabling live campaigns so Caddy can issue trusted certificates and email DNS can be configured.
 
 The bootstrap script creates `.env`, generates random secrets, validates the Compose file, builds the application, downloads images/model, starts the services, and prints their status. Before public use, review these values:
 
