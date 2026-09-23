@@ -34,6 +34,7 @@ if ($normalized.Count -eq 0) { throw "No proxies found in source file." }
 $destinationPath = [IO.Path]::GetFullPath((Join-Path (Get-Location) $Destination))
 $destinationDirectory = Split-Path -Parent $destinationPath
 [IO.Directory]::CreateDirectory($destinationDirectory) | Out-Null
-[IO.File]::WriteAllLines($destinationPath, $normalized, [Text.UTF8Encoding]::new($false))
+$proxyFile = ($normalized -join "`n") + "`n"
+[IO.File]::WriteAllText($destinationPath, $proxyFile, [Text.UTF8Encoding]::new($false))
 
 Write-Host "Imported $($normalized.Count) proxies into $destinationPath (credentials hidden)."

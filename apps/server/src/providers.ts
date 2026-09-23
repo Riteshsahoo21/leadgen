@@ -43,18 +43,20 @@ export async function discoverBusinesses(input: CreateRunInput): Promise<Busines
   });
   if (!response.ok) throw new Error(`Maps service rejected the job (${response.status}): ${await response.text()}`);
   const payload = await response.json() as Record<string, any>;
-  if (Array.isArray(payload.results)) return payload.results.map(mapMapsResult).slice(0, input.targetCount);
-  const jobId = String(payload.id ?? payload.job_id ?? payload.job?.id ?? '');
+  const immediateResults = payload.results ?? payload.Results;
+  if (Array.isArray(immediateResults)) return immediateResults.map(mapMapsResult).slice(0, input.targetCount);
+  const jobId = String(payload.id ?? payload.ID ?? payload.job_id ?? payload.job?.id ?? '');
   if (!jobId) throw new Error('Maps service returned neither results nor a job ID');
   for (let attempt = 0; attempt < 180; attempt += 1) {
     await delay(10_000);
     const statusResponse = await fetch(`${config.GMAPS_API_URL}/api/v1/jobs/${encodeURIComponent(jobId)}`, { signal: AbortSignal.timeout(15_000) });
     if (!statusResponse.ok) throw new Error(`Maps job status failed (${statusResponse.status})`);
     const statusPayload = await statusResponse.json() as Record<string, any>;
-    if (Array.isArray(statusPayload.results)) return statusPayload.results.map(mapMapsResult).slice(0, input.targetCount);
-    const status = String(statusPayload.status ?? statusPayload.state ?? '').toLowerCase();
+    const statusResults = statusPayload.results ?? statusPayload.Results;
+    if (Array.isArray(statusResults)) return statusResults.map(mapMapsResult).slice(0, input.targetCount);
+    const status = String(statusPayload.status ?? statusPayload.Status ?? statusPayload.state ?? statusPayload.State ?? '').toLowerCase();
     if (['failed', 'error', 'cancelled'].includes(status)) throw new Error(`Maps job ${jobId} ${status}: ${statusPayload.error ?? ''}`);
-    if (['completed', 'complete', 'done', 'success', 'succeeded'].includes(status)) {
+    if (['completed', 'complete', 'done', 'success', 'succeeded', 'ok'].includes(status)) {
       const download = await fetch(`${config.GMAPS_API_URL}/api/v1/jobs/${encodeURIComponent(jobId)}/download`, { signal: AbortSignal.timeout(30_000) });
       if (!download.ok) throw new Error(`Maps result download failed (${download.status})`);
       const rows = parse(await download.text(), { columns: true, skip_empty_lines: true, relax_column_count: true }) as unknown[];
