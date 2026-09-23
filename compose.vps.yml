@@ -1,0 +1,13 @@
+services:
+  api:
+    ports:
+      - "127.0.0.1:3001:3001"
+
+  web:
+    ports:
+      - "127.0.0.1:8080:80"
+
+  # The VPS already uses host Nginx for several sites and for TLS. Keep Caddy
+  # available for other installations, but exclude it from the default VPS run.
+  caddy:
+    profiles: ["caddy"]

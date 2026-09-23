@@ -33,6 +33,16 @@ The four arguments are the dashboard host, Posta host, Posta administrator email
 
 This exposes only the dashboard at `http://203.0.113.10`. Posta remains private in IP mode because its administrator login must not travel over plain HTTP. Add domains before configuring Posta or enabling live campaigns so Caddy can issue trusted certificates and email DNS can be configured.
 
+### VPS with an existing Nginx installation
+
+When host Nginx already owns ports 80 and 443, use the VPS override instead of the bundled Caddy edge service:
+
+```bash
+docker compose -f compose.yml -f compose.vps.yml up -d --build
+```
+
+This publishes the React container only on `127.0.0.1:8080` and the API only on `127.0.0.1:3001`. PostgreSQL, Redis, Maps, SearXNG, and Ollama remain private. Install `deploy/nginx-ritzla.in.conf` as the host virtual server after updating its domain and certificate paths if required. Test both loopback services and run `nginx -t` before reloading Nginx.
+
 The bootstrap script creates `.env`, generates random secrets, validates the Compose file, builds the application, downloads images/model, starts the services, and prints their status. Before public use, review these values:
 
 The proxy importer accepts Webshare's `host:port:user:password` format or complete `http://`, `https://`, and SOCKS proxy URLs. It writes a normalized, mode-`600` file to `secrets/gmaps-proxies.txt`. That directory is excluded from Git and Docker build contexts. Compose mounts the file read-only only into the Maps scraper, so these proxies are used for initial Google Maps discovery and not for website crawling, AI, search, or email delivery.

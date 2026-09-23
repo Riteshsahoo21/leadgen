@@ -256,6 +256,83 @@ export async function recentEvents(limit = 30) {
   return result.rows;
 }
 
+export async function listBusinesses(input: { search?: string | undefined; status?: string | undefined; limit?: number | undefined; offset?: number | undefined } = {}) {
+  const search = input.search?.trim() ?? '';
+  const status = input.status?.trim() ?? '';
+  const limit = Math.min(Math.max(input.limit ?? 50, 1), 200);
+  const offset = Math.max(input.offset ?? 0, 0);
+  const where = `WHERE ($1 = '' OR c.name ILIKE '%' || $1 || '%' OR c.city ILIKE '%' || $1 || '%'
+      OR c.country ILIKE '%' || $1 || '%' OR c.category ILIKE '%' || $1 || '%' OR c.domain ILIKE '%' || $1 || '%')
+    AND ($2 = '' OR c.status = $2)`;
+  const [items, count] = await Promise.all([
+    pool.query(
+      `SELECT c.id,c.run_id,c.name,c.category,c.city,c.country,c.address,c.website,c.domain,c.phone,
+         c.rating,c.review_count,c.status,c.filter_score,c.created_at,c.updated_at,
+         q.qualified,q.score AS qualification_score,q.opportunity,q.pain_points,q.recommended_role,
+         x.full_name,x.role,x.source_url,x.confidence AS contact_confidence,
+         e.email,e.verification_status,e.confidence AS email_confidence
+       FROM companies c
+       LEFT JOIN qualifications q ON q.company_id=c.id
+       LEFT JOIN LATERAL (SELECT * FROM contacts WHERE company_id=c.id ORDER BY confidence DESC LIMIT 1) x ON true
+       LEFT JOIN LATERAL (SELECT * FROM contact_emails WHERE company_id=c.id ORDER BY confidence DESC LIMIT 1) e ON true
+       ${where}
+       ORDER BY c.updated_at DESC LIMIT $3 OFFSET $4`,
+      [search, status, limit, offset],
+    ),
+    pool.query<{ count: number }>(`SELECT count(*)::int AS count FROM companies c ${where}`, [search, status]),
+  ]);
+  return { items: items.rows, total: count.rows[0]?.count ?? 0, limit, offset };
+}
+
+export async function getBusinessDetail(id: string) {
+  const result = await pool.query(
+    `SELECT c.*,
+       row_to_json(q) AS qualification,
+       row_to_json(w) AS website_evidence,
+       COALESCE((SELECT jsonb_agg(x ORDER BY x.confidence DESC) FROM contacts x WHERE x.company_id=c.id), '[]'::jsonb) AS contacts,
+       COALESCE((SELECT jsonb_agg(e ORDER BY e.confidence DESC) FROM contact_emails e WHERE e.company_id=c.id), '[]'::jsonb) AS emails,
+       COALESCE((SELECT jsonb_agg(m ORDER BY m.created_at DESC) FROM messages m WHERE m.company_id=c.id), '[]'::jsonb) AS messages
+     FROM companies c
+     LEFT JOIN qualifications q ON q.company_id=c.id
+     LEFT JOIN website_evidence w ON w.company_id=c.id
+     WHERE c.id=$1`,
+    [id],
+  );
+  return result.rows[0];
+}
+
+export async function listQualifications(input: { qualified?: boolean | undefined; limit?: number | undefined } = {}) {
+  const limit = Math.min(Math.max(input.limit ?? 100, 1), 250);
+  const result = await pool.query(
+    `SELECT q.*,c.name AS company_name,c.category,c.city,c.country,c.website,c.status
+     FROM qualifications q JOIN companies c ON c.id=q.company_id
+     WHERE ($1::boolean IS NULL OR q.qualified=$1)
+     ORDER BY q.score DESC,q.created_at DESC LIMIT $2`,
+    [input.qualified ?? null, limit],
+  );
+  return result.rows;
+}
+
+export async function listMessages(input: { direction?: string | undefined; limit?: number | undefined } = {}) {
+  const direction = input.direction?.trim() ?? '';
+  const limit = Math.min(Math.max(input.limit ?? 100, 1), 250);
+  const result = await pool.query(
+    `SELECT m.*,c.name AS company_name,e.email,x.full_name,x.role
+     FROM messages m
+     JOIN companies c ON c.id=m.company_id
+     JOIN contact_emails e ON e.id=m.contact_email_id
+     JOIN contacts x ON x.id=e.contact_id
+     WHERE ($1='' OR m.direction=$1)
+     ORDER BY m.created_at DESC LIMIT $2`,
+    [direction, limit],
+  );
+  return result.rows;
+}
+
+export async function listPipelineEvents(limit = 100) {
+  return recentEvents(Math.min(Math.max(limit, 1), 250));
+}
+
 export async function eligibleEmail(emailId: string) {
   const result = await pool.query(
     `SELECT e.*,c.run_id,c.name AS company_name,x.full_name,x.role,q.opportunity,q.pain_points

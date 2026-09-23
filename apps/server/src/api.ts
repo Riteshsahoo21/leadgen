@@ -5,6 +5,7 @@ import { z } from 'zod';
 import { config } from './config.js';
 import {
   closeDatabase, createRun, dashboardOverview, databaseHealth, getRun, listRuns, pool,
+  getBusinessDetail, listBusinesses, listMessages, listPipelineEvents, listQualifications,
   recentEvents, recentLeads, setRunStatus,
 } from './db.js';
 import { createRunSchema } from './domain.js';
@@ -51,6 +52,46 @@ app.get('/api/overview', async () => {
 });
 
 app.get('/api/runs', async () => ({ runs: await listRuns(50) }));
+
+const listQuerySchema = z.object({
+  search: z.string().max(120).optional(),
+  status: z.string().max(80).optional(),
+  direction: z.enum(['inbound', 'outbound']).optional(),
+  qualified: z.enum(['true', 'false']).optional(),
+  limit: z.coerce.number().int().min(1).max(250).optional(),
+  offset: z.coerce.number().int().min(0).optional(),
+});
+
+app.get('/api/businesses', async (request, reply) => {
+  const parsed = listQuerySchema.safeParse(request.query);
+  if (!parsed.success) return reply.code(400).send({ error: 'Invalid query', issues: parsed.error.issues });
+  return listBusinesses(parsed.data);
+});
+
+app.get<{ Params: { id: string } }>('/api/businesses/:id', async (request, reply) => {
+  const business = await getBusinessDetail(request.params.id);
+  if (!business) return reply.code(404).send({ error: 'Business not found' });
+  return { business };
+});
+
+app.get('/api/qualifications', async (request, reply) => {
+  const parsed = listQuerySchema.safeParse(request.query);
+  if (!parsed.success) return reply.code(400).send({ error: 'Invalid query', issues: parsed.error.issues });
+  const qualified = parsed.data.qualified === undefined ? undefined : parsed.data.qualified === 'true';
+  return { qualifications: await listQualifications({ qualified, limit: parsed.data.limit }) };
+});
+
+app.get('/api/messages', async (request, reply) => {
+  const parsed = listQuerySchema.safeParse(request.query);
+  if (!parsed.success) return reply.code(400).send({ error: 'Invalid query', issues: parsed.error.issues });
+  return { messages: await listMessages({ direction: parsed.data.direction, limit: parsed.data.limit }) };
+});
+
+app.get('/api/events', async (request, reply) => {
+  const parsed = listQuerySchema.safeParse(request.query);
+  if (!parsed.success) return reply.code(400).send({ error: 'Invalid query', issues: parsed.error.issues });
+  return { events: await listPipelineEvents(parsed.data.limit) };
+});
 
 app.get<{ Params: { id: string } }>('/api/runs/:id', async (request, reply) => {
   const run = await getRun(request.params.id);
