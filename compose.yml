@@ -92,6 +92,9 @@ services:
 
   worker:
     image: leadforge-server:local
+    build:
+      context: .
+      dockerfile: apps/server/Dockerfile
     command: ["node", "apps/server/dist/worker.js"]
     environment: *server-env
     depends_on:
@@ -180,7 +183,9 @@ services:
       OLLAMA_MAX_LOADED_MODELS: "1"
       OLLAMA_NUM_PARALLEL: "1"
       OLLAMA_CONTEXT_LENGTH: "4096"
-      OLLAMA_KEEP_ALIVE: "5m"
+      # Unload the model after each request. The API process stays idle between
+      # jobs while the CPU quota protects other applications on the VPS.
+      OLLAMA_KEEP_ALIVE: "0"
     volumes:
       - ollama_data:/root/.ollama
     healthcheck:
@@ -189,6 +194,7 @@ services:
       timeout: 5s
       retries: 10
     restart: unless-stopped
+    cpus: ${OLLAMA_CPU_LIMIT:-1.0}
     mem_limit: 3200m
     memswap_limit: 3200m
     pids_limit: 300
@@ -203,6 +209,7 @@ services:
     depends_on:
       ollama: { condition: service_healthy }
     restart: "no"
+    cpus: 0.50
     mem_limit: 128m
     networks: [private]
 

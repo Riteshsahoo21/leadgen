@@ -99,6 +99,8 @@ PostgreSQL is the source of truth. Redis contains only recoverable queue state. 
 
 The worker uses ordinary HTTP first and launches Chromium only when a site returns too little meaningful HTML. A process-wide lock permits only one fallback browser at a time. Ollama and the Maps scraper also run at concurrency one by default.
 
+Ollama is capped to one vCPU by default with `OLLAMA_CPU_LIMIT=1.0`. Qwen is unloaded immediately after every request, so the Ollama API remains idle between queued qualification jobs instead of retaining the model or consuming inference CPU continuously. Lowering the quota further reduces impact but increases qualification time.
+
 ### Memory budget
 
 Compose applies hard limits. The default research/enrichment stack stays below the full mail-enabled budget and leaves additional room for the operating system and Docker:

@@ -199,7 +199,7 @@ export async function qualifyBusiness(candidate: BusinessCandidate, evidence?: R
   };
   const response = await fetch(`${config.OLLAMA_URL}/api/chat`, {
     method: 'POST', headers: { 'content-type': 'application/json' }, signal: AbortSignal.timeout(120_000),
-    body: JSON.stringify({ model: config.OLLAMA_MODEL, stream: false, format: schema, keep_alive: '5m',
+    body: JSON.stringify({ model: config.OLLAMA_MODEL, stream: false, format: schema, keep_alive: 0,
       options: { temperature: 0.1, num_ctx: 4096 }, messages: [
         { role: 'system', content: 'Qualify only from supplied evidence. Never invent facts. Return strict JSON.' },
         { role: 'user', content: JSON.stringify({ company: candidate, websiteEvidence: evidence ?? null }) },
