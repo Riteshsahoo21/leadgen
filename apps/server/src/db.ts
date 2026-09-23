@@ -143,7 +143,7 @@ export async function saveEvidence(companyId: string, evidence: Record<string, u
     [
       companyId, evidence.title ?? null, evidence.description ?? null, evidence.about ?? null,
       evidence.services ?? [], evidence.emails ?? [], evidence.phones ?? [], evidence.socialLinks ?? [],
-      evidence.contactSources ?? [], evidence.technologies ?? [],
+      JSON.stringify(evidence.contactSources ?? []), evidence.technologies ?? [],
       evidence.hasContactForm ?? false, evidence.hasBooking ?? false, evidence.hasPayment ?? false,
       evidence.pagesCrawled ?? 0, evidence.usedBrowser ?? false, JSON.stringify(evidence),
     ],
