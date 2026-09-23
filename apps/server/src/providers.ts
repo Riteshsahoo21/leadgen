@@ -38,7 +38,14 @@ export async function discoverBusinesses(input: CreateRunInput): Promise<Busines
   const response = await fetch(`${config.GMAPS_API_URL}/api/v1/jobs`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ keywords, lang: 'en', max_results: Math.min(input.targetCount, config.MAX_DISCOVERY_RESULTS) }),
+    body: JSON.stringify({
+      name: input.name,
+      keywords,
+      lang: 'en',
+      depth: 1,
+      max_time: 180,
+      max_results: Math.min(input.targetCount, config.MAX_DISCOVERY_RESULTS),
+    }),
     signal: AbortSignal.timeout(30_000),
   });
   if (!response.ok) throw new Error(`Maps service rejected the job (${response.status}): ${await response.text()}`);
