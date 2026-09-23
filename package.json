@@ -1,0 +1,22 @@
+{
+  "name": "leadforge",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "workspaces": [
+    "apps/*"
+  ],
+  "scripts": {
+    "dev": "concurrently -n api,worker,web -c cyan,magenta,green \"npm run dev -w @leadforge/server\" \"npm run dev:worker -w @leadforge/server\" \"npm run dev -w @leadforge/web\"",
+    "build": "npm run build -w @leadforge/server && npm run build -w @leadforge/web",
+    "test": "npm run test -w @leadforge/server",
+    "typecheck": "npm run typecheck -w @leadforge/server && npm run typecheck -w @leadforge/web"
+  },
+  "devDependencies": {
+    "concurrently": "^9.2.1",
+    "typescript": "^5.9.3"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}

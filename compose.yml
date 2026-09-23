@@ -1,0 +1,313 @@
+name: leadforge
+
+x-server-env: &server-env
+  NODE_ENV: production
+  API_PORT: 3001
+  API_TOKEN: ${API_TOKEN:?Set API_TOKEN in .env}
+  APP_ORIGIN: https://${DOMAIN:-localhost}
+  DATABASE_URL: postgres://${POSTGRES_USER:-leadforge}:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-leadforge}
+  REDIS_URL: redis://redis:6379
+  PROVIDER_MODE: ${PROVIDER_MODE:-safe}
+  MIN_FILTER_SCORE: ${MIN_FILTER_SCORE:-25}
+  MIN_QUALIFICATION_SCORE: ${MIN_QUALIFICATION_SCORE:-60}
+  MAX_DISCOVERY_RESULTS: ${MAX_DISCOVERY_RESULTS:-5000}
+  MAX_PAGES_PER_SITE: ${MAX_PAGES_PER_SITE:-5}
+  CHROMIUM_PATH: /usr/bin/chromium
+  DISCOVERY_CONCURRENCY: ${DISCOVERY_CONCURRENCY:-1}
+  CRAWL_CONCURRENCY: ${CRAWL_CONCURRENCY:-3}
+  AI_CONCURRENCY: ${AI_CONCURRENCY:-1}
+  SEARCH_CONCURRENCY: ${SEARCH_CONCURRENCY:-2}
+  ENRICHMENT_CONCURRENCY: ${ENRICHMENT_CONCURRENCY:-2}
+  CAMPAIGN_CONCURRENCY: ${CAMPAIGN_CONCURRENCY:-1}
+  GMAPS_API_URL: http://gmaps:8080
+  SEARXNG_URL: http://searxng:8080
+  OLLAMA_URL: http://ollama:11434
+  OLLAMA_MODEL: ${OLLAMA_MODEL:-qwen3:4b}
+  POSTA_URL: http://posta:9000
+  POSTA_API_KEY: ${POSTA_API_KEY:-}
+  POSTA_WEBHOOK_SECRET: ${POSTA_WEBHOOK_SECRET:?Set POSTA_WEBHOOK_SECRET}
+  POSTA_FROM: ${POSTA_FROM:-hello@example.com}
+  ENABLE_EMAIL_SENDING: ${ENABLE_EMAIL_SENDING:-false}
+  DAILY_SEND_LIMIT: ${DAILY_SEND_LIMIT:-100}
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    command: ["postgres", "-c", "shared_buffers=128MB", "-c", "effective_cache_size=256MB", "-c", "max_connections=60"]
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-leadforge}
+      POSTGRES_USER: ${POSTGRES_USER:-leadforge}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./database:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-leadforge} -d ${POSTGRES_DB:-leadforge}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+    mem_limit: 512m
+    memswap_limit: 512m
+    pids_limit: 200
+    networks: [private]
+
+  redis:
+    image: redis:7.4-alpine
+    command: ["redis-server", "--appendonly", "yes", "--maxmemory", "96mb", "--maxmemory-policy", "noeviction"]
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+    mem_limit: 160m
+    memswap_limit: 160m
+    pids_limit: 100
+    networks: [private]
+
+  api:
+    image: leadforge-server:local
+    build:
+      context: .
+      dockerfile: apps/server/Dockerfile
+    environment: *server-env
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://localhost:3001/health').then(r=>{if(!r.ok)process.exit(1)})"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+    mem_limit: 256m
+    memswap_limit: 256m
+    pids_limit: 150
+    security_opt: ["no-new-privileges:true"]
+    networks: [private]
+
+  worker:
+    image: leadforge-server:local
+    command: ["node", "apps/server/dist/worker.js"]
+    environment: *server-env
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    restart: unless-stopped
+    mem_limit: 640m
+    memswap_limit: 640m
+    shm_size: 96m
+    pids_limit: 300
+    security_opt: ["no-new-privileges:true"]
+    networks: [private]
+
+  web:
+    build:
+      context: .
+      dockerfile: apps/web/Dockerfile
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost/healthz"]
+      interval: 15s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+    mem_limit: 64m
+    memswap_limit: 64m
+    pids_limit: 80
+    security_opt: ["no-new-privileges:true"]
+    networks: [private]
+
+  caddy:
+    image: caddy:2.10-alpine
+    environment:
+      DOMAIN: ${DOMAIN:-localhost}
+      POSTA_DOMAIN: ${POSTA_DOMAIN:-posta.localhost}
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      web: { condition: service_healthy }
+      api: { condition: service_healthy }
+    restart: unless-stopped
+    mem_limit: 96m
+    memswap_limit: 96m
+    pids_limit: 100
+    networks: [private]
+
+  gmaps:
+    image: gosom/google-maps-scraper:latest
+    command: ["-web", "-addr", ":8080", "-data-folder", "/gmapsdata", "-c", "1", "-browser-pool-size", "1", "-pages-per-browser", "1", "-proxies-file", "/run/secrets/gmaps-proxies.txt"]
+    environment:
+      DISABLE_TELEMETRY: "1"
+    volumes:
+      - gmaps_data:/gmapsdata
+      - ./secrets/gmaps-proxies.txt:/run/secrets/gmaps-proxies.txt:ro
+    restart: unless-stopped
+    mem_limit: 512m
+    memswap_limit: 512m
+    shm_size: 96m
+    pids_limit: 300
+    networks: [private]
+
+  searxng:
+    image: searxng/searxng:latest
+    environment:
+      SEARXNG_BASE_URL: http://searxng:8080/
+      GRANIAN_WORKERS: "1"
+      GRANIAN_BLOCKING_THREADS: "2"
+    volumes:
+      - ./config/searxng/settings.yml:/etc/searxng/settings.yml:ro
+      - searxng_cache:/var/cache/searxng
+    restart: unless-stopped
+    mem_limit: 320m
+    memswap_limit: 320m
+    pids_limit: 180
+    security_opt: ["no-new-privileges:true"]
+    networks: [private]
+
+  ollama:
+    image: ollama/ollama:latest
+    environment:
+      OLLAMA_MAX_LOADED_MODELS: "1"
+      OLLAMA_NUM_PARALLEL: "1"
+      OLLAMA_CONTEXT_LENGTH: "4096"
+      OLLAMA_KEEP_ALIVE: "5m"
+    volumes:
+      - ollama_data:/root/.ollama
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+    mem_limit: 3200m
+    memswap_limit: 3200m
+    pids_limit: 300
+    networks: [private]
+
+  ollama-model:
+    image: ollama/ollama:latest
+    environment:
+      OLLAMA_HOST: http://ollama:11434
+    entrypoint: ["/bin/sh", "-c"]
+    command: ["ollama pull ${OLLAMA_MODEL:-qwen3:4b}"]
+    depends_on:
+      ollama: { condition: service_healthy }
+    restart: "no"
+    mem_limit: 128m
+    networks: [private]
+
+  posta-db:
+    image: postgres:17-alpine
+    command: ["postgres", "-c", "shared_buffers=64MB", "-c", "effective_cache_size=128MB", "-c", "max_connections=30"]
+    environment:
+      POSTGRES_USER: posta
+      POSTGRES_PASSWORD: ${POSTA_DB_PASSWORD:?Set POSTA_DB_PASSWORD}
+      POSTGRES_DB: posta
+    volumes:
+      - posta_db_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U posta -d posta"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+    mem_limit: 256m
+    memswap_limit: 256m
+    networks: [private]
+
+  posta-redis:
+    image: redis:7.4-alpine
+    command: ["redis-server", "--appendonly", "yes", "--maxmemory", "48mb", "--maxmemory-policy", "noeviction"]
+    volumes:
+      - posta_redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+    mem_limit: 64m
+    memswap_limit: 64m
+    networks: [private]
+
+  posta:
+    build:
+      context: https://github.com/goposta/posta.git#main
+      dockerfile: docker/Dockerfile
+    environment:
+      POSTA_ENV: production
+      POSTA_DB_URL: host=posta-db user=posta password=${POSTA_DB_PASSWORD} dbname=posta port=5432 sslmode=disable
+      POSTA_REDIS_ADDR: posta-redis:6379
+      POSTA_JWT_SECRET: ${POSTA_JWT_SECRET:?Set POSTA_JWT_SECRET}
+      POSTA_ADMIN_EMAIL: ${POSTA_ADMIN_EMAIL:?Set POSTA_ADMIN_EMAIL}
+      POSTA_ADMIN_PASSWORD: ${POSTA_ADMIN_PASSWORD:?Set POSTA_ADMIN_PASSWORD}
+      POSTA_WEB_URL: https://${POSTA_DOMAIN}
+      POSTA_CORS_ORIGINS: https://${POSTA_DOMAIN}
+      POSTA_EMBEDDED_WORKER: "true"
+      POSTA_WORKER_CONCURRENCY: "1"
+      POSTA_RATE_LIMIT_DAILY: ${DAILY_SEND_LIMIT:-100}
+      POSTA_ENCRYPTION_KEY: ${POSTA_ENCRYPTION_KEY:?Set POSTA_ENCRYPTION_KEY}
+      POSTA_INBOUND_ENABLED: "true"
+      POSTA_INBOUND_SMTP_HOST: 0.0.0.0
+      POSTA_INBOUND_SMTP_PORT: "2525"
+      POSTA_INBOUND_HOSTNAME: ${POSTA_DOMAIN}
+      POSTA_AUTO_SUPPRESS_ON_REJECT: "true"
+    ports:
+      - "25:2525"
+    depends_on:
+      posta-db: { condition: service_healthy }
+      posta-redis: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:9000/healthz"]
+      interval: 15s
+      timeout: 5s
+      start_period: 20s
+      retries: 8
+    restart: unless-stopped
+    mem_limit: 320m
+    memswap_limit: 320m
+    pids_limit: 160
+    networks: [private]
+
+  backup:
+    image: postgres:17-alpine
+    entrypoint: ["/bin/sh", "-c"]
+    command: ["while true; do /scripts/backup.sh; sleep 86400; done"]
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-leadforge}
+      POSTGRES_USER: ${POSTGRES_USER:-leadforge}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      BACKUP_RETENTION_DAYS: ${BACKUP_RETENTION_DAYS:-7}
+    volumes:
+      - ./scripts/backup.sh:/scripts/backup.sh:ro
+      - ./backups:/backups
+    depends_on:
+      postgres: { condition: service_healthy }
+    restart: unless-stopped
+    mem_limit: 96m
+    memswap_limit: 96m
+    networks: [private]
+
+networks:
+  private:
+    driver: bridge
+
+volumes:
+  postgres_data:
+  redis_data:
+  gmaps_data:
+  searxng_cache:
+  ollama_data:
+  posta_db_data:
+  posta_redis_data:
+  caddy_data:
+  caddy_config:

@@ -1,0 +1,145 @@
+import { timingSafeEqual } from 'node:crypto';
+import cors from '@fastify/cors';
+import Fastify from 'fastify';
+import { z } from 'zod';
+import { config } from './config.js';
+import {
+  closeDatabase, createRun, dashboardOverview, databaseHealth, getRun, listRuns, pool,
+  recentEvents, recentLeads, setRunStatus,
+} from './db.js';
+import { createRunSchema } from './domain.js';
+import { closeQueues, enqueue, queueSnapshot } from './queues.js';
+
+const app = Fastify({ logger: { level: config.NODE_ENV === 'production' ? 'info' : 'debug' } });
+
+await app.register(cors, {
+  origin: config.APP_ORIGIN.split(',').map((origin) => origin.trim()),
+  methods: ['GET', 'POST', 'DELETE'],
+});
+
+app.addHook('onRequest', async (request, reply) => {
+  if (!request.url.startsWith('/api/')) return;
+  const supplied = request.headers.authorization?.replace(/^Bearer\s+/i, '') ?? '';
+  if (!secureEqual(supplied, config.API_TOKEN)) {
+    return reply.code(401).send({ error: 'Unauthorized', message: 'Enter the API token configured on the VPS.' });
+  }
+});
+
+app.get('/health', async (_request, reply) => {
+  try {
+    const databaseTime = await databaseHealth();
+    return { status: 'ok', databaseTime, mode: config.PROVIDER_MODE };
+  } catch (error) {
+    return reply.code(503).send({ status: 'unhealthy', error: error instanceof Error ? error.message : String(error) });
+  }
+});
+
+app.get('/api/config', async () => ({
+  providerMode: config.PROVIDER_MODE,
+  emailSending: config.ENABLE_EMAIL_SENDING,
+  dailySendLimit: config.DAILY_SEND_LIMIT,
+  maxDiscoveryResults: config.MAX_DISCOVERY_RESULTS,
+  qualificationThreshold: config.MIN_QUALIFICATION_SCORE,
+}));
+
+app.get('/api/overview', async () => {
+  const [overview, queues, runs, leads, events] = await Promise.all([
+    dashboardOverview(), queueSnapshot(), listRuns(8), recentLeads(12), recentEvents(16),
+  ]);
+  return { overview, queues, runs, leads, events };
+});
+
+app.get('/api/runs', async () => ({ runs: await listRuns(50) }));
+
+app.get<{ Params: { id: string } }>('/api/runs/:id', async (request, reply) => {
+  const run = await getRun(request.params.id);
+  if (!run) return reply.code(404).send({ error: 'Run not found' });
+  const companies = await pool.query(
+    `SELECT c.*,q.score AS qualification_score,q.opportunity
+     FROM companies c LEFT JOIN qualifications q ON q.company_id=c.id
+     WHERE c.run_id=$1 ORDER BY c.updated_at DESC LIMIT 200`, [run.id],
+  );
+  return { run, companies: companies.rows };
+});
+
+app.post('/api/runs', async (request, reply) => {
+  const parsed = createRunSchema.safeParse(request.body);
+  if (!parsed.success) return reply.code(400).send({ error: 'Invalid discovery request', issues: parsed.error.issues });
+  const run = await createRun(parsed.data);
+  await enqueue('discovery', 'discover-businesses', { runId: run.id }, `discovery:${run.id}`);
+  return reply.code(202).send({ run });
+});
+
+app.post<{ Params: { id: string } }>('/api/runs/:id/cancel', async (request, reply) => {
+  const run = await getRun(request.params.id);
+  if (!run) return reply.code(404).send({ error: 'Run not found' });
+  if (['completed', 'failed', 'cancelled'].includes(run.status)) {
+    return reply.code(409).send({ error: `Run is already ${run.status}` });
+  }
+  await setRunStatus(run.id, 'cancelled');
+  return { status: 'cancelled' };
+});
+
+const inboundSchema = z.object({
+  from: z.union([z.string(), z.object({ email: z.string() })]),
+  subject: z.string().default(''),
+  text: z.string().default(''),
+  html: z.string().default(''),
+  id: z.string().optional(),
+}).passthrough();
+
+app.post('/webhooks/posta', async (request, reply) => {
+  if (!secureEqual(String(request.headers['x-webhook-secret'] ?? ''), config.POSTA_WEBHOOK_SECRET)) {
+    return reply.code(401).send({ error: 'Invalid webhook secret' });
+  }
+  const parsed = inboundSchema.safeParse(request.body);
+  if (!parsed.success) return reply.code(400).send({ error: 'Invalid webhook body' });
+  const from = typeof parsed.data.from === 'string' ? parsed.data.from : parsed.data.from.email;
+  const address = from.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i)?.[0]?.toLowerCase();
+  if (!address) return reply.code(400).send({ error: 'No sender email found' });
+  const emailResult = await pool.query(
+    `SELECT e.*,c.run_id FROM contact_emails e JOIN companies c ON c.id=e.company_id WHERE e.email=$1 LIMIT 1`, [address],
+  );
+  const email = emailResult.rows[0];
+  if (!email) return reply.code(202).send({ status: 'ignored', reason: 'unknown sender' });
+  const content = `${parsed.data.subject}\n${parsed.data.text || parsed.data.html}`;
+  const category = classifyReply(content);
+  await pool.query(
+    `INSERT INTO messages (run_id,company_id,contact_email_id,direction,status,provider_id,subject,body,reply_category)
+     VALUES ($1,$2,$3,'inbound','received',$4,$5,$6,$7)`,
+    [email.run_id, email.company_id, email.id, parsed.data.id ?? null, parsed.data.subject, content, category],
+  );
+  await pool.query('UPDATE companies SET status=$2 WHERE id=$1', [email.company_id, category === 'INTERESTED' ? 'interested' : 'replied']);
+  if (['UNSUBSCRIBE', 'NOT_INTERESTED'].includes(category)) {
+    await pool.query(
+      `INSERT INTO suppression_list (email,reason,source) VALUES ($1,$2,'reply') ON CONFLICT (email) DO NOTHING`,
+      [address, category.toLowerCase()],
+    );
+  }
+  return { status: 'accepted', category };
+});
+
+function classifyReply(value: string) {
+  if (/unsubscribe|remove me|stop emailing|opt.?out/i.test(value)) return 'UNSUBSCRIBE';
+  if (/not interested|no thanks|do not contact/i.test(value)) return 'NOT_INTERESTED';
+  if (/price|pricing|cost|quote|budget/i.test(value)) return 'PRICING';
+  if (/wrong person|not the right person/i.test(value)) return 'WRONG_PERSON';
+  if (/interested|let.s talk|book|meeting|sounds good/i.test(value)) return 'INTERESTED';
+  if (/\?/.test(value)) return 'QUESTION';
+  return 'NEEDS_HUMAN';
+}
+
+function secureEqual(left: string, right: string) {
+  const a = Buffer.from(left); const b = Buffer.from(right);
+  return a.length === b.length && timingSafeEqual(a, b);
+}
+
+async function shutdown(signal: string) {
+  app.log.info({ signal }, 'Shutting down');
+  await app.close(); await closeQueues(); await closeDatabase();
+  process.exit(0);
+}
+process.on('SIGTERM', () => void shutdown('SIGTERM'));
+process.on('SIGINT', () => void shutdown('SIGINT'));
+
+await app.listen({ host: '0.0.0.0', port: config.API_PORT });

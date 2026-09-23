@@ -1,0 +1,24 @@
+{$DOMAIN:localhost} {
+  encode zstd gzip
+
+  handle /api/* {
+    reverse_proxy api:3001
+  }
+
+  handle /webhooks/* {
+    reverse_proxy api:3001
+  }
+
+  handle /health {
+    reverse_proxy api:3001
+  }
+
+  handle {
+    reverse_proxy web:80
+  }
+}
+
+{$POSTA_DOMAIN:posta.localhost} {
+  encode zstd gzip
+  reverse_proxy posta:9000
+}

@@ -1,0 +1,23 @@
+use_default_settings: true
+
+general:
+  debug: false
+  instance_name: LeadForge Research
+
+search:
+  safe_search: 1
+  formats:
+    - html
+    - json
+
+server:
+  limiter: false
+  image_proxy: false
+  secret_key: "replace-through-private-network-only"
+
+ui:
+  static_use_hash: true
+
+enabled_plugins:
+  - 'Hash plugin'
+  - 'Self Information'

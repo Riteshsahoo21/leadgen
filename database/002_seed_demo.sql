@@ -1,0 +1,2 @@
+-- Intentionally empty. Demo data is created through the dashboard so every
+-- seeded company belongs to a visible discovery run.
