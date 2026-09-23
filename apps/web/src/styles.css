@@ -159,6 +159,7 @@ td small { margin-top: 3px; color: var(--subtle); font-size: 8px; }
 .business-table td:nth-child(2) { min-width: 155px; }
 
 .detail-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 13px; margin-bottom: 13px; }
+.detail-section { margin-bottom: 13px; }
 .detail-list { display: grid; gap: 15px; }
 .detail-list > span { display: grid; grid-template-columns: 26px minmax(0,1fr); gap: 8px; color: var(--blue); }
 .detail-list div { display: flex; flex-direction: column; }

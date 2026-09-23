@@ -3,12 +3,13 @@ import { config } from './config.js';
 import {
   closeDatabase, createMessage, eligibleEmail, getCompany, getEvidence, getRun, insertCompany, pool,
   logEvent, markDiscoveryFinished, maybeCompleteRun, refreshRunStats, saveContact, saveEmail,
-  saveEvidence, saveQualification, setRunStatus, updateCompanyFilter, updateCompanyStatus,
+  saveEvidence, saveQualification, setRunStatus, updateCompanyFilter, updateCompanyStatus, mergePublicContactEvidence,
 } from './db.js';
 import { calculateFilterScore, type BusinessCandidate, type CreateRunInput } from './domain.js';
 import { closeQueues, connection, enqueue } from './queues.js';
 import {
-  crawlWebsite, discoverBusinesses, enrichEmail, findDecisionMaker, qualifyBusiness, sendWithPosta,
+  crawlWebsite, discoverBusinesses, enrichEmails, findDecisionMaker, parseOwner, parseStringList,
+  qualifyBusiness, researchPublicContacts, sendWithPosta,
 } from './providers.js';
 
 type RunJob = { runId: string };
@@ -97,8 +98,9 @@ addWorker('qualify', async (job: Job<CompanyJob>) => {
   const qualification = await qualifyBusiness(fromCompany(company), evidence);
   await saveQualification(company.id, qualification);
   if (!qualification.qualified) {
-    await updateCompanyStatus(company.id, 'unqualified');
-    await finishOne(company.run_id);
+    await updateCompanyStatus(company.id, 'research_queued');
+    await enqueue('research', 'research-public-contacts', job.data, `research:${company.id}`);
+    await maybeRefresh(company.run_id);
     return;
   }
   await updateCompanyStatus(company.id, 'research_queued');
@@ -109,7 +111,26 @@ addWorker('qualify', async (job: Job<CompanyJob>) => {
 addWorker('research', async (job: Job<CompanyJob>) => {
   const company = await getCompany(job.data.companyId);
   if (!company) return;
-  const contact = await findDecisionMaker(fromCompany(company));
+  const candidate = fromCompany(company);
+  let evidence = await getEvidence(company.id);
+  if (company.website && ['refresh-public-contacts', 'backfill-public-contacts'].includes(job.name)) {
+    try {
+      await saveEvidence(company.id, await crawlWebsite(candidate));
+      evidence = await getEvidence(company.id);
+    } catch (error) {
+      await logEvent(company.run_id, 'research', `Contact refresh crawl failed: ${error instanceof Error ? error.message : String(error)}`, company.id);
+    }
+  }
+  const publicResearch = await researchPublicContacts(candidate, evidence);
+  await mergePublicContactEvidence(company.id, publicResearch);
+  let contact = await findDecisionMaker(candidate, 'Owner', publicResearch.searchResults);
+  if (!contact && publicResearch.emails.length) {
+    const emailSource = publicResearch.sources.find((source) => source.kind === 'email');
+    contact = {
+      fullName: company.name, role: 'Business contact', sourceUrl: emailSource?.sourceUrl,
+      confidence: emailSource?.sourceType === 'company_website' || emailSource?.sourceType === 'google_maps' ? 82 : 68,
+    };
+  }
   if (!contact) {
     await updateCompanyStatus(company.id, 'no_contact');
     await finishOne(company.run_id);
@@ -133,15 +154,17 @@ addWorker('enrich', async (job: Job<CompanyJob & { contactId: string }>) => {
   const contactResult = await pool.query('SELECT * FROM contacts WHERE id=$1', [job.data.contactId]);
   const contact = contactResult.rows[0];
   if (!contact) return;
-  const result = await enrichEmail(fromCompany(company), contact.full_name, evidence?.emails ?? []);
-  if (!result) {
+  const sources = Array.isArray(evidence?.contact_sources) ? evidence.contact_sources : [];
+  const results = await enrichEmails(fromCompany(company), contact.full_name, sources, evidence?.emails ?? []);
+  if (!results.length) {
     await updateCompanyStatus(company.id, 'no_email');
     await finishOne(company.run_id);
     return;
   }
-  const email = await saveEmail(contact.id, company.id, result);
-  if (result.status !== 'valid') {
-    await updateCompanyStatus(company.id, result.status === 'invalid' ? 'invalid_email' : 'email_risky');
+  const savedEmails = await Promise.all(results.map((result) => saveEmail(contact.id, company.id, result)));
+  const validIndex = results.findIndex((result) => result.status === 'valid');
+  if (validIndex < 0) {
+    await updateCompanyStatus(company.id, results.some((result) => result.status === 'risky') ? 'email_risky' : 'invalid_email');
     await finishOne(company.run_id);
     return;
   }
@@ -151,7 +174,8 @@ addWorker('enrich', async (job: Job<CompanyJob & { contactId: string }>) => {
     return;
   }
   await updateCompanyStatus(company.id, 'campaign_queued');
-  await enqueue('campaign', 'prepare-message', { ...job.data, emailId: email.id }, `campaign:${email.id}`);
+  const campaignEmail = savedEmails[validIndex]!;
+  await enqueue('campaign', 'prepare-message', { ...job.data, emailId: campaignEmail.id }, `campaign:${campaignEmail.id}`);
   await maybeRefresh(company.run_id);
 }, config.ENRICHMENT_CONCURRENCY);
 
@@ -176,12 +200,14 @@ addWorker('campaign', async (job: Job<CompanyJob & { emailId: string }>) => {
   config.ENABLE_EMAIL_SENDING ? { max: config.DAILY_SEND_LIMIT, duration: 86_400_000 } : undefined);
 
 function fromCompany(company: Record<string, any>): BusinessCandidate {
+  const raw = company.raw_data as Record<string, unknown> | undefined;
   return {
     sourceId: company.source_id, name: company.name, category: company.category,
     categories: company.categories, country: company.country, city: company.city,
     address: company.address, phone: company.phone, website: company.website,
     rating: company.rating == null ? undefined : Number(company.rating), reviewCount: company.review_count,
-    latitude: company.latitude, longitude: company.longitude, raw: company.raw_data,
+    latitude: company.latitude, longitude: company.longitude,
+    publicEmails: parseStringList(raw?.emails), owner: parseOwner(raw?.owner), raw,
   };
 }
 

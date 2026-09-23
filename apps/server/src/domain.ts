@@ -36,6 +36,8 @@ export type BusinessCandidate = {
   reviewCount?: number | undefined;
   latitude?: number | undefined;
   longitude?: number | undefined;
+  publicEmails?: string[] | undefined;
+  owner?: { name: string; sourceUrl?: string | undefined } | undefined;
   raw?: Record<string, unknown> | undefined;
 };
 

@@ -37,6 +37,7 @@ export type Lead = {
   review_count?: number;
   status: string;
   filter_score?: number;
+  filter_reasons?: string[];
   qualified?: boolean;
   qualification_score?: number;
   opportunity?: string;
@@ -51,6 +52,7 @@ export type Lead = {
   email_confidence?: number;
   created_at?: string;
   updated_at?: string;
+  raw_data?: Record<string, unknown>;
 };
 
 export type Qualification = {

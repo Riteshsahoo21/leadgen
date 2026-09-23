@@ -129,19 +129,21 @@ export async function updateCompanyStatus(id: string, status: string) {
 export async function saveEvidence(companyId: string, evidence: Record<string, unknown>) {
   await pool.query(
     `INSERT INTO website_evidence (
-       company_id,title,description,about,services,emails,social_links,technologies,
+       company_id,title,description,about,services,emails,phones,social_links,contact_sources,technologies,
        has_contact_form,has_booking,has_payment,pages_crawled,used_browser,evidence
-     ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+     ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
      ON CONFLICT (company_id) DO UPDATE SET
        title=EXCLUDED.title,description=EXCLUDED.description,about=EXCLUDED.about,
-       services=EXCLUDED.services,emails=EXCLUDED.emails,social_links=EXCLUDED.social_links,
+       services=EXCLUDED.services,emails=EXCLUDED.emails,phones=EXCLUDED.phones,
+       social_links=EXCLUDED.social_links,contact_sources=EXCLUDED.contact_sources,
        technologies=EXCLUDED.technologies,has_contact_form=EXCLUDED.has_contact_form,
        has_booking=EXCLUDED.has_booking,has_payment=EXCLUDED.has_payment,
        pages_crawled=EXCLUDED.pages_crawled,used_browser=EXCLUDED.used_browser,
        evidence=EXCLUDED.evidence,crawled_at=now()`,
     [
       companyId, evidence.title ?? null, evidence.description ?? null, evidence.about ?? null,
-      evidence.services ?? [], evidence.emails ?? [], evidence.socialLinks ?? [], evidence.technologies ?? [],
+      evidence.services ?? [], evidence.emails ?? [], evidence.phones ?? [], evidence.socialLinks ?? [],
+      evidence.contactSources ?? [], evidence.technologies ?? [],
       evidence.hasContactForm ?? false, evidence.hasBooking ?? false, evidence.hasPayment ?? false,
       evidence.pagesCrawled ?? 0, evidence.usedBrowser ?? false, JSON.stringify(evidence),
     ],
@@ -151,6 +153,32 @@ export async function saveEvidence(companyId: string, evidence: Record<string, u
 export async function getEvidence(companyId: string) {
   const result = await pool.query('SELECT * FROM website_evidence WHERE company_id = $1', [companyId]);
   return result.rows[0];
+}
+
+export type PublicContactEvidence = {
+  emails: string[];
+  phones: string[];
+  socialLinks: string[];
+  sources: Array<{ kind: 'email' | 'phone' | 'social'; value: string; sourceType: string; sourceUrl?: string }>;
+};
+
+export async function mergePublicContactEvidence(companyId: string, value: PublicContactEvidence) {
+  await pool.query(
+    `INSERT INTO website_evidence (company_id,emails,phones,social_links,contact_sources,evidence)
+     VALUES ($1,$2,$3,$4,$5,jsonb_build_object('publicContactSources',$5::jsonb))
+     ON CONFLICT (company_id) DO UPDATE SET
+       emails=ARRAY(SELECT DISTINCT item FROM unnest(website_evidence.emails || EXCLUDED.emails) item),
+       phones=ARRAY(SELECT DISTINCT item FROM unnest(website_evidence.phones || EXCLUDED.phones) item),
+       social_links=ARRAY(SELECT DISTINCT item FROM unnest(website_evidence.social_links || EXCLUDED.social_links) item),
+       contact_sources=(website_evidence.contact_sources || EXCLUDED.contact_sources),
+       evidence=website_evidence.evidence || jsonb_build_object(
+         'publicContactSources', website_evidence.contact_sources || EXCLUDED.contact_sources
+       )`,
+    [companyId, value.emails, value.phones, value.socialLinks, JSON.stringify(value.sources)],
+  );
+  if (value.phones[0]) {
+    await pool.query('UPDATE companies SET phone=COALESCE(NULLIF(phone,\'\'),$2) WHERE id=$1', [companyId, value.phones[0]]);
+  }
 }
 
 export async function saveQualification(companyId: string, value: {
