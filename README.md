@@ -45,6 +45,7 @@ POSTA_PUBLIC_URL=https://mail.example.com
 POSTA_FROM=hello@example.com
 POSTA_ADMIN_EMAIL=admin@example.com
 PROVIDER_MODE=safe
+PIPELINE_STOP_AFTER=enrichment
 ENABLE_EMAIL_SENDING=false
 ```
 
@@ -53,7 +54,9 @@ Create DNS `A` records for both domains pointing to the VPS. Open TCP ports 80 a
 Open `https://leads.example.com` and enter `API_TOKEN` from `.env`. The initial configuration is deliberately safe:
 
 - `PROVIDER_MODE=safe` creates deterministic demonstration businesses and never performs public research.
-- `ENABLE_EMAIL_SENDING=false` creates message drafts but never sends them.
+- `PIPELINE_STOP_AFTER=enrichment` stops after finding and verifying candidate emails.
+- `ENABLE_EMAIL_SENDING=false` is a second lock that prevents all sending.
+- Posta and its supporting database/Redis are not started unless the optional `mail` profile is enabled.
 - Switch to live mode only after the providers, sending domain, suppression behavior, and local law have been tested.
 
 Useful commands:
@@ -88,7 +91,7 @@ The worker uses ordinary HTTP first and launches Chromium only when a site retur
 
 ### Memory budget
 
-Compose applies hard limits; active containers have approximately 6.4 GB of combined limits, leaving room for the operating system and Docker:
+Compose applies hard limits. The default research/enrichment stack stays below the full mail-enabled budget and leaves additional room for the operating system and Docker:
 
 | Group | Hard limit |
 | --- | ---: |
@@ -96,7 +99,7 @@ Compose applies hard limits; active containers have approximately 6.4 GB of comb
 | Application API + worker + web + Caddy | 1.05 GB |
 | Maps scraper + SearXNG | 832 MB |
 | LeadForge PostgreSQL + Redis | 672 MB |
-| Posta + its PostgreSQL/Redis | 640 MB |
+| Optional Posta + its PostgreSQL/Redis | 640 MB (not started by default) |
 | Backup job | 96 MB |
 
 `docker compose stats` shows actual use. If the host starts swapping heavily, set `CRAWL_CONCURRENCY=2`, then restart the worker. Do not increase AI or browser parallelism on an 8 GB VPS.
@@ -134,7 +137,13 @@ SMTP recipient probing is intentionally not performed by default: many providers
 
 ### Posta and replies
 
-Posta is built from its official repository as part of Compose and is available at `https://POSTA_DOMAIN`. Sign in with `POSTA_ADMIN_EMAIL` and `POSTA_ADMIN_PASSWORD` from `.env`, then:
+Posta is isolated in the optional `mail` Compose profile. The normal bootstrap does not build or start it. When a domain and mail configuration are ready, start it explicitly:
+
+```bash
+docker compose --profile mail up -d --build posta posta-db posta-redis
+```
+
+Posta is then available at `https://POSTA_DOMAIN`. Sign in with `POSTA_ADMIN_EMAIL` and `POSTA_ADMIN_PASSWORD` from `.env`, then:
 
 1. Add and verify the sending domain/SMTP configuration.
 2. Create an API key and copy it into `POSTA_API_KEY` in `.env`.

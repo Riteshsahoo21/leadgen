@@ -52,7 +52,7 @@ export async function markDiscoveryFinished(id: string) {
 
 const terminalCompanyStatuses = [
   'filtered_out', 'unqualified', 'no_contact', 'no_email', 'email_risky',
-  'invalid_email', 'drafted', 'contacted', 'failed',
+  'invalid_email', 'contact_found', 'email_verified', 'drafted', 'contacted', 'failed',
 ];
 
 export async function maybeCompleteRun(runId: string) {

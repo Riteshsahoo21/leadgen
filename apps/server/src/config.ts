@@ -13,6 +13,7 @@ const envSchema = z.object({
   DATABASE_URL: z.string().default('postgres://leadforge:leadforge@localhost:5432/leadforge'),
   REDIS_URL: z.string().default('redis://localhost:6379'),
   PROVIDER_MODE: z.enum(['safe', 'live']).default('safe'),
+  PIPELINE_STOP_AFTER: z.enum(['research', 'enrichment', 'draft']).default('enrichment'),
   MIN_FILTER_SCORE: z.coerce.number().int().min(0).max(100).default(25),
   MIN_QUALIFICATION_SCORE: z.coerce.number().int().min(0).max(100).default(60),
   MAX_DISCOVERY_RESULTS: z.coerce.number().int().min(1).max(50000).default(5000),

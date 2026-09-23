@@ -8,6 +8,7 @@ x-server-env: &server-env
   DATABASE_URL: postgres://${POSTGRES_USER:-leadforge}:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-leadforge}
   REDIS_URL: redis://redis:6379
   PROVIDER_MODE: ${PROVIDER_MODE:-safe}
+  PIPELINE_STOP_AFTER: ${PIPELINE_STOP_AFTER:-enrichment}
   MIN_FILTER_SCORE: ${MIN_FILTER_SCORE:-25}
   MIN_QUALIFICATION_SCORE: ${MIN_QUALIFICATION_SCORE:-60}
   MAX_DISCOVERY_RESULTS: ${MAX_DISCOVERY_RESULTS:-5000}
@@ -206,6 +207,7 @@ services:
     networks: [private]
 
   posta-db:
+    profiles: ["mail"]
     image: postgres:17-alpine
     command: ["postgres", "-c", "shared_buffers=64MB", "-c", "effective_cache_size=128MB", "-c", "max_connections=30"]
     environment:
@@ -225,6 +227,7 @@ services:
     networks: [private]
 
   posta-redis:
+    profiles: ["mail"]
     image: redis:7.4-alpine
     command: ["redis-server", "--appendonly", "yes", "--maxmemory", "48mb", "--maxmemory-policy", "noeviction"]
     volumes:
@@ -240,6 +243,7 @@ services:
     networks: [private]
 
   posta:
+    profiles: ["mail"]
     build:
       context: https://github.com/goposta/posta.git#main
       dockerfile: docker/Dockerfile

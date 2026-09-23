@@ -116,6 +116,11 @@ addWorker('research', async (job: Job<CompanyJob>) => {
     return;
   }
   const saved = await saveContact(company.id, contact);
+  if (config.PIPELINE_STOP_AFTER === 'research') {
+    await updateCompanyStatus(company.id, 'contact_found');
+    await finishOne(company.run_id);
+    return;
+  }
   await updateCompanyStatus(company.id, 'enrich_queued');
   await enqueue('enrich', 'enrich-email', { ...job.data, contactId: saved.id }, `enrich:${company.id}:${saved.id}`);
   await maybeRefresh(company.run_id);
@@ -137,6 +142,11 @@ addWorker('enrich', async (job: Job<CompanyJob & { contactId: string }>) => {
   const email = await saveEmail(contact.id, company.id, result);
   if (result.status !== 'valid') {
     await updateCompanyStatus(company.id, result.status === 'invalid' ? 'invalid_email' : 'email_risky');
+    await finishOne(company.run_id);
+    return;
+  }
+  if (config.PIPELINE_STOP_AFTER === 'enrichment') {
+    await updateCompanyStatus(company.id, 'email_verified');
     await finishOne(company.run_id);
     return;
   }

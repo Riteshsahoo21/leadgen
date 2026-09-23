@@ -36,6 +36,7 @@ app.get('/health', async (_request, reply) => {
 
 app.get('/api/config', async () => ({
   providerMode: config.PROVIDER_MODE,
+  pipelineStopAfter: config.PIPELINE_STOP_AFTER,
   emailSending: config.ENABLE_EMAIL_SENDING,
   dailySendLimit: config.DAILY_SEND_LIMIT,
   maxDiscoveryResults: config.MAX_DISCOVERY_RESULTS,
