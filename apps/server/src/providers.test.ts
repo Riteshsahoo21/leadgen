@@ -1,5 +1,7 @@
 import { describe, expect, it } from 'vitest';
-import { extractEmails, extractEvidence, extractPhones, mapsDepthFor, parseStringList } from './providers.js';
+import {
+  extractEmails, extractEvidence, extractPhones, hybridQualificationScore, mapsDepthFor, parseStringList,
+} from './providers.js';
 
 describe('public contact extraction', () => {
   it('normalizes Maps email arrays and separated values', () => {
@@ -18,6 +20,12 @@ describe('public contact extraction', () => {
   it('scales Maps depth with the requested volume and query count', () => {
     expect(mapsDepthFor(100, 10)).toBe(1);
     expect(mapsDepthFor(2_000, 12)).toBe(10);
+  });
+
+  it('does not let an anomalous AI score discard stronger deterministic evidence', () => {
+    expect(hybridQualificationScore(74, 0)).toBe(74);
+    expect(hybridQualificationScore(52, 88)).toBe(88);
+    expect(hybridQualificationScore(65, 'invalid')).toBe(65);
   });
 
   it('requires direct purchase controls instead of payment-provider mentions', () => {

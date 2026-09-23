@@ -422,7 +422,7 @@ export async function qualifyBusiness(candidate: BusinessCandidate, evidence?: R
     publicEmailsFound: Array.isArray(evidence.emails) ? evidence.emails.length : 0,
     publicPhonesFound: Array.isArray(evidence.phones) ? evidence.phones.length : 0,
     socialProfilesFound: Array.isArray(evidence.social_links) ? evidence.social_links.length : 0,
-    textSample: String(evidence.text_sample ?? '').slice(0, 1_800),
+    textSample: String(storedEvidence.textSample ?? '').slice(0, 1_800),
   } : null;
   const compactCompany = {
     name: candidate.name, category: candidate.category, categories: candidate.categories,
@@ -441,14 +441,14 @@ export async function qualifyBusiness(candidate: BusinessCandidate, evidence?: R
     if (!response.ok) throw new Error(`Ollama error ${response.status}`);
     const data = await response.json() as { message?: { content?: string } };
     const parsed = JSON.parse(data.message?.content ?? '{}') as Record<string, unknown>;
-    const score = Math.max(0, Math.min(100, Number(parsed.score ?? 0)));
+    const score = hybridQualificationScore(baseline, parsed.score);
     const painPoints = normalizePainPoints(Array.isArray(parsed.pain_points) ? parsed.pain_points.map(String).slice(0, 5) : fallback.painPoints, pagesCrawled);
     const aiRationale = String(parsed.rationale ?? '').trim();
     const rationale = aiRationale && rationaleMatchesEvidence(aiRationale, capabilities)
       ? aiRationale : buildQualificationRationale(candidate, evidence, painPoints);
     return {
-      qualified: Boolean(parsed.qualified) && score >= config.MIN_QUALIFICATION_SCORE, score,
-      opportunity: String(parsed.opportunity ?? fallback.opportunity),
+      qualified: ruleResult.qualified || (Boolean(parsed.qualified) && score >= config.MIN_QUALIFICATION_SCORE), score,
+      opportunity: fallback.opportunity,
       painPoints,
       recommendedRole: String(parsed.recommended_role ?? 'Owner'), rationale, model: config.OLLAMA_MODEL,
     };
@@ -777,13 +777,19 @@ function buildQualificationRationale(candidate: BusinessCandidate, evidence: Rec
 
 function normalizePainPoints(values: string[], pagesCrawled: number) {
   const checkedPages = `on ${pagesCrawled} checked page${pagesCrawled === 1 ? '' : 's'}`;
-  return values.map((value) => {
+  return [...new Set(values.map((value) => {
     if (pagesCrawled === 0 && /booking|payment|purchase|contact form|e-?commerce/i.test(value)) return 'Website capability could not be confirmed from public pages';
     if (/^(?:no|missing|lacks?)\b.*booking/i.test(value)) return `No online booking flow detected ${checkedPages}`;
     if (/^(?:no|missing|lacks?)\b.*contact form/i.test(value)) return `No contact form detected ${checkedPages}`;
     if (/^(?:no|missing|lacks?)\b.*(?:payment|purchase|checkout|e-?commerce)/i.test(value)) return `No online purchase or payment flow detected ${checkedPages}`;
     return value;
-  });
+  }))];
+}
+
+export function hybridQualificationScore(baseline: number, aiValue: unknown) {
+  const aiScore = Number(aiValue);
+  const boundedAiScore = Number.isFinite(aiScore) ? Math.max(0, Math.min(100, aiScore)) : 0;
+  return Math.max(Math.max(0, Math.min(100, baseline)), boundedAiScore);
 }
 
 function rationaleMatchesEvidence(value: string, capabilities: unknown) {
