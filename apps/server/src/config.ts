@@ -17,7 +17,7 @@ const envSchema = z.object({
   MIN_FILTER_SCORE: z.coerce.number().int().min(0).max(100).default(25),
   MIN_QUALIFICATION_SCORE: z.coerce.number().int().min(0).max(100).default(60),
   MAX_DISCOVERY_RESULTS: z.coerce.number().int().min(1).max(50000).default(5000),
-  MAX_PAGES_PER_SITE: z.coerce.number().int().min(1).max(10).default(5),
+  MAX_PAGES_PER_SITE: z.coerce.number().int().min(1).max(12).default(8),
   CHROMIUM_PATH: z.string().default('/usr/bin/chromium'),
   DISCOVERY_CONCURRENCY: z.coerce.number().int().min(1).max(4).default(1),
   CRAWL_CONCURRENCY: z.coerce.number().int().min(1).max(8).default(3),

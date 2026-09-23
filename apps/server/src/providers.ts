@@ -35,6 +35,7 @@ export async function discoverBusinesses(input: CreateRunInput): Promise<Busines
   if (config.PROVIDER_MODE === 'safe') return safeBusinesses(input);
 
   const keywords = input.cities.flatMap((city) => input.businessTypes.map((type) => `${type} in ${city}, ${input.country}`));
+  const depth = mapsDepthFor(input.targetCount, keywords.length);
   const response = await fetch(`${config.GMAPS_API_URL}/api/v1/jobs`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
@@ -42,9 +43,9 @@ export async function discoverBusinesses(input: CreateRunInput): Promise<Busines
       name: input.name,
       keywords,
       lang: 'en',
-      depth: 1,
+      depth,
       email: true,
-      max_time: 180,
+      max_time: Math.min(1_200, Math.max(300, depth * keywords.length * 12)),
       max_results: Math.min(input.targetCount, config.MAX_DISCOVERY_RESULTS),
     }),
     signal: AbortSignal.timeout(30_000),
@@ -74,6 +75,10 @@ export async function discoverBusinesses(input: CreateRunInput): Promise<Busines
   throw new Error(`Maps job ${jobId} did not complete within 30 minutes`);
 }
 
+export function mapsDepthFor(targetCount: number, keywordCount: number) {
+  return Math.min(10, Math.max(1, Math.ceil(targetCount / Math.max(keywordCount, 1) / 15)));
+}
+
 function mapMapsResult(item: unknown): BusinessCandidate {
   const row = item as Record<string, unknown>;
   const owner = parseOwner(row.owner);
@@ -94,11 +99,19 @@ export type ContactEvidenceSource = {
   kind: 'email' | 'phone' | 'social'; value: string; sourceType: string; sourceUrl?: string;
 };
 
+export type CapabilitySignal = {
+  status: 'detected' | 'not_detected' | 'unknown';
+  sourceUrls: string[];
+  evidence: string[];
+};
+
 export type WebsiteEvidence = {
   title: string; description: string; about: string; services: string[]; emails: string[]; phones: string[];
   socialLinks: string[]; technologies: string[]; hasContactForm: boolean; hasBooking: boolean;
   hasPayment: boolean; pagesCrawled: number; usedBrowser: boolean; textSample: string;
   contactSources: ContactEvidenceSource[];
+  capabilities: Record<'contactForm' | 'booking' | 'onlinePurchase', CapabilitySignal>;
+  pages: Array<{ url: string; title: string }>;
 };
 
 export async function crawlWebsite(candidate: BusinessCandidate): Promise<WebsiteEvidence> {
@@ -116,6 +129,12 @@ export async function crawlWebsite(candidate: BusinessCandidate): Promise<Websit
         ...(candidate.publicEmails ?? []).map((value) => ({ kind: 'email' as const, value, sourceType: 'google_maps' })),
         ...(candidate.phone ? [{ kind: 'phone' as const, value: candidate.phone, sourceType: 'google_maps' }] : []),
       ],
+      capabilities: {
+        contactForm: demoCapability(seed % 3 !== 0, 'Demo contact form'),
+        booking: demoCapability(seed % 4 === 0, 'Demo booking flow'),
+        onlinePurchase: demoCapability(seed % 5 === 0, 'Demo purchase flow'),
+      },
+      pages: [{ url: candidate.website ?? 'https://example.com', title: candidate.name }],
     };
   }
   if (!candidate.website) throw new Error('Cannot crawl a company without a website');
@@ -132,26 +151,37 @@ export async function crawlWebsite(candidate: BusinessCandidate): Promise<Websit
       });
       if (response.ok && response.headers.get('content-type')?.includes('text/html')) {
         const html = (await response.text()).slice(0, 1_000_000);
-        documents.push({ url, html });
+        const finalUrl = response.url || url;
+        documents.push({ url: finalUrl, html });
         const $ = load(html);
+        const discoveredLinks: Array<{ url: string; priority: number }> = [];
         $('a[href]').each((_, node) => {
           const href = $(node).attr('href');
           const label = $(node).text();
-          if (!href || !/contact|about|team|staff|services|booking|support/i.test(`${href} ${label}`)) return;
+          const priority = pagePriority(`${href ?? ''} ${label}`);
+          if (!href || priority === 0) return;
           try {
-            const discovered = new URL(href, root);
+            const discovered = new URL(href, finalUrl);
             discovered.hash = ''; discovered.search = '';
-            if (discovered.origin === root.origin && !urls.includes(discovered.toString())) urls.push(discovered.toString());
+            if (sameHostname(discovered, root) && !urls.includes(discovered.toString())) discoveredLinks.push({ url: discovered.toString(), priority });
           } catch { /* ignore malformed links */ }
+        });
+        discoveredLinks.sort((left, right) => right.priority - left.priority).forEach((item) => {
+          if (!urls.includes(item.url)) urls.push(item.url);
         });
       }
     } catch { /* one broken page must not fail the company */ }
   }
   let evidence = documents.length ? extractEvidence(documents, candidate) : undefined;
   if (!evidence || evidence.textSample.length < 500) {
-    const rendered = await renderWithBrowser(root.toString());
-    evidence = extractEvidence([{ url: root.toString(), html: rendered }], candidate);
-    evidence.usedBrowser = true;
+    try {
+      const rendered = await renderWithBrowser(root.toString());
+      const merged = [...documents.filter((document) => document.url !== root.toString()), { url: root.toString(), html: rendered }];
+      evidence = extractEvidence(merged, candidate);
+      evidence.usedBrowser = true;
+    } catch (error) {
+      if (!evidence) throw error;
+    }
   }
   return evidence;
 }
@@ -178,22 +208,31 @@ function renderWithBrowser(url: string): Promise<string> {
   return task;
 }
 
-function extractEvidence(documents: Array<{ url: string; html: string }>, candidate: BusinessCandidate): WebsiteEvidence {
+export function extractEvidence(documents: Array<{ url: string; html: string }>, candidate: BusinessCandidate): WebsiteEvidence {
   const texts: string[] = [];
   const emails = new Set<string>(candidate.publicEmails ?? []);
   const phones = new Set<string>(candidate.phone ? [candidate.phone] : []);
   const socialLinks = new Set<string>();
   const services = new Set<string>();
   const contactSources = new Map<string, ContactEvidenceSource>();
+  const capabilityHits: Record<'contactForm' | 'booking' | 'onlinePurchase', { sourceUrls: Set<string>; evidence: Set<string> }> = {
+    contactForm: { sourceUrls: new Set(), evidence: new Set() },
+    booking: { sourceUrls: new Set(), evidence: new Set() },
+    onlinePurchase: { sourceUrls: new Set(), evidence: new Set() },
+  };
+  const pages: Array<{ url: string; title: string }> = [];
   for (const email of candidate.publicEmails ?? []) addContactSource(contactSources, { kind: 'email', value: email, sourceType: 'google_maps' });
   if (candidate.phone) addContactSource(contactSources, { kind: 'phone', value: candidate.phone, sourceType: 'google_maps' });
   let title = ''; let description = ''; let hasContactForm = false; let hasBooking = false; let hasPayment = false;
   for (const document of documents) {
     const $ = load(document.html);
+    extractStructuredData($, document.url, emails, phones, socialLinks, contactSources, services, capabilityHits);
     $('script,style,noscript,svg').remove();
     const text = $('body').text().replace(/\s+/g, ' ').trim();
     texts.push(text.slice(0, 12_000));
-    title ||= $('title').first().text().trim();
+    const pageTitle = $('title').first().text().replace(/\s+/g, ' ').trim();
+    pages.push({ url: document.url, title: pageTitle || new URL(document.url).pathname || candidate.name });
+    title ||= pageTitle;
     description ||= $('meta[name="description"]').attr('content')?.trim() ?? '';
     $('a[href^="mailto:"]').each((_, node) => {
       const value = normalizeEmail($(node).attr('href')?.slice(7).split('?')[0]);
@@ -203,18 +242,47 @@ function extractEvidence(documents: Array<{ url: string; html: string }>, candid
       const value = normalizePhone($(node).attr('href')?.slice(4));
       if (value) { phones.add(value); addContactSource(contactSources, { kind: 'phone', value, sourceType: 'company_website', sourceUrl: document.url }); }
     });
+    $('[data-email],[data-phone],[data-tel]').each((_, node) => {
+      const email = normalizeEmail($(node).attr('data-email'));
+      const phone = normalizePhone($(node).attr('data-phone') ?? $(node).attr('data-tel'));
+      if (email) { emails.add(email); addContactSource(contactSources, { kind: 'email', value: email, sourceType: 'company_website', sourceUrl: document.url }); }
+      if (phone) { phones.add(phone); addContactSource(contactSources, { kind: 'phone', value: phone, sourceType: 'company_website', sourceUrl: document.url }); }
+    });
     $('a[href]').each((_, node) => {
       const href = $(node).attr('href') ?? '';
+      if (/wa\.me\/|api\.whatsapp\.com\/send/i.test(href)) {
+        const value = normalizePhone(href.match(/(?:phone=|wa\.me\/)(\+?\d{8,15})/i)?.[1]);
+        if (value) { phones.add(value); addContactSource(contactSources, { kind: 'phone', value, sourceType: 'company_website', sourceUrl: document.url }); }
+      }
       if (/linkedin|facebook|instagram|x\.com|twitter/i.test(href)) {
-        socialLinks.add(href);
-        addContactSource(contactSources, { kind: 'social', value: href, sourceType: 'company_website', sourceUrl: document.url });
+        try {
+          const socialUrl = new URL(href, document.url).toString();
+          socialLinks.add(socialUrl);
+          addContactSource(contactSources, { kind: 'social', value: socialUrl, sourceType: 'company_website', sourceUrl: document.url });
+        } catch { /* malformed social URL */ }
       }
       const label = $(node).text().replace(/\s+/g, ' ').trim();
-      if (/service/i.test(href) && label.length > 2 && label.length < 80) services.add(label);
+      if (/service|product|solution|menu|pricing|shop/i.test(`${href} ${label}`) && label.length > 2 && label.length < 80) services.add(label);
     });
-    hasContactForm ||= $('form input[type="email"], form textarea').length > 0;
-    hasBooking ||= /book now|schedule|appointment|calendly/i.test(text);
-    hasPayment ||= /checkout|pay now|stripe|razorpay|paypal/i.test(`${text} ${document.html}`);
+    $('form').each((_, node) => {
+      const form = $(node);
+      const formSignal = `${form.attr('id') ?? ''} ${form.attr('class') ?? ''} ${form.attr('action') ?? ''} ${form.text()}`.replace(/\s+/g, ' ').trim();
+      if (form.find('input[type="email"],input[type="tel"],textarea').length && /contact|message|enquir|inquiry|email|phone|support|name/i.test(formSignal)) {
+        addCapabilityHit(capabilityHits.contactForm, document.url, compactSignal(formSignal, 'Contact form with public reply fields'));
+      }
+      if (/book|booking|appointment|schedule|reservation|calendly/i.test(formSignal)) addCapabilityHit(capabilityHits.booking, document.url, compactSignal(formSignal, 'Booking form'));
+      if (/checkout|cart|buy now|purchase|place order|order now/i.test(formSignal)) addCapabilityHit(capabilityHits.onlinePurchase, document.url, compactSignal(formSignal, 'Purchase form'));
+    });
+    $('a[href],button,[role="button"]').each((_, node) => {
+      const control = $(node);
+      const signal = `${control.attr('href') ?? ''} ${control.attr('aria-label') ?? ''} ${control.text()}`.replace(/\s+/g, ' ').trim();
+      if (/\b(book now|book online|schedule (?:now|online|appointment)|make an appointment|reserve now)\b/i.test(signal) || /calendly\.com|cal\.com\/|booking\.com\/.*reserve/i.test(signal)) {
+        addCapabilityHit(capabilityHits.booking, document.url, compactSignal(signal, 'Booking control'));
+      }
+      if (/\b(add to cart|buy now|checkout|purchase now|place order|order online|shop now)\b/i.test(signal) || /\/checkout(?:[/?#]|$)|\/cart(?:[/?#]|$)/i.test(signal)) {
+        addCapabilityHit(capabilityHits.onlinePurchase, document.url, compactSignal(signal, 'Purchase control'));
+      }
+    });
     for (const value of extractEmails(text)) {
       emails.add(value); addContactSource(contactSources, { kind: 'email', value, sourceType: 'company_website', sourceUrl: document.url });
     }
@@ -222,6 +290,9 @@ function extractEvidence(documents: Array<{ url: string; html: string }>, candid
       phones.add(value); addContactSource(contactSources, { kind: 'phone', value, sourceType: 'company_website', sourceUrl: document.url });
     }
   }
+  hasContactForm = capabilityHits.contactForm.evidence.size > 0;
+  hasBooking = capabilityHits.booking.evidence.size > 0;
+  hasPayment = capabilityHits.onlinePurchase.evidence.size > 0;
   const combined = texts.join(' ').slice(0, 24_000);
   return {
     title, description, about: combined.slice(0, 2_000), services: [...services].slice(0, 20),
@@ -229,15 +300,97 @@ function extractEvidence(documents: Array<{ url: string; html: string }>, candid
     socialLinks: [...socialLinks].slice(0, 20), technologies: [],
     hasContactForm, hasBooking, hasPayment, pagesCrawled: documents.length, usedBrowser: false,
     textSample: combined.slice(0, 8_000), contactSources: [...contactSources.values()].slice(0, 60),
+    capabilities: {
+      contactForm: capabilitySignal(capabilityHits.contactForm, documents.length),
+      booking: capabilitySignal(capabilityHits.booking, documents.length),
+      onlinePurchase: capabilitySignal(capabilityHits.onlinePurchase, documents.length),
+    },
+    pages,
   };
 }
 
+function pagePriority(value: string) {
+  if (/contact|reach-us|get-in-touch/i.test(value)) return 100;
+  if (/booking|appointment|schedule|reserve|checkout|cart|order|shop|store/i.test(value)) return 90;
+  if (/about|team|staff|leadership|founder/i.test(value)) return 75;
+  if (/services?|products?|solutions?|menu|pricing|plans?/i.test(value)) return 65;
+  if (/support|help|faq|locations?|branches/i.test(value)) return 50;
+  return 0;
+}
+
+function sameHostname(left: URL, right: URL) {
+  return left.hostname.replace(/^www\./i, '').toLowerCase() === right.hostname.replace(/^www\./i, '').toLowerCase();
+}
+
+function addCapabilityHit(target: { sourceUrls: Set<string>; evidence: Set<string> }, sourceUrl: string, evidence: string) {
+  target.sourceUrls.add(sourceUrl);
+  if (evidence) target.evidence.add(evidence.slice(0, 180));
+}
+
+function capabilitySignal(target: { sourceUrls: Set<string>; evidence: Set<string> }, pagesCrawled: number): CapabilitySignal {
+  return {
+    status: target.evidence.size ? 'detected' : pagesCrawled ? 'not_detected' : 'unknown',
+    sourceUrls: [...target.sourceUrls].slice(0, 5), evidence: [...target.evidence].slice(0, 5),
+  };
+}
+
+function demoCapability(detected: boolean, evidence: string): CapabilitySignal {
+  return { status: detected ? 'detected' : 'not_detected', sourceUrls: [], evidence: detected ? [evidence] : [] };
+}
+
+function compactSignal(value: string, fallback: string) {
+  const compact = value.replace(/\s+/g, ' ').trim();
+  return compact.length >= 3 ? compact.slice(0, 180) : fallback;
+}
+
+function extractStructuredData(
+  $: ReturnType<typeof load>, sourceUrl: string, emails: Set<string>, phones: Set<string>, socialLinks: Set<string>,
+  contactSources: Map<string, ContactEvidenceSource>, services: Set<string>,
+  capabilities: Record<'contactForm' | 'booking' | 'onlinePurchase', { sourceUrls: Set<string>; evidence: Set<string> }>,
+) {
+  $('script[type="application/ld+json"]').each((_, node) => {
+    try {
+      const parsed = JSON.parse($(node).text()) as unknown;
+      const queue: unknown[] = Array.isArray(parsed) ? [...parsed] : [parsed];
+      while (queue.length) {
+        const value = queue.shift();
+        if (!value || typeof value !== 'object') continue;
+        const record = value as Record<string, unknown>;
+        if (Array.isArray(record['@graph'])) queue.push(...record['@graph']);
+        for (const key of ['contactPoint','department','subOrganization','location','itemListElement','hasOfferCatalog']) {
+          const nested = record[key];
+          if (Array.isArray(nested)) queue.push(...nested);
+          else if (nested && typeof nested === 'object') queue.push(nested);
+        }
+        const email = normalizeEmail(record.email);
+        if (email) { emails.add(email); addContactSource(contactSources, { kind: 'email', value: email, sourceType: 'structured_data', sourceUrl }); }
+        const phone = normalizePhone(record.telephone);
+        if (phone) { phones.add(phone); addContactSource(contactSources, { kind: 'phone', value: phone, sourceType: 'structured_data', sourceUrl }); }
+        const sameAs = Array.isArray(record.sameAs) ? record.sameAs : record.sameAs ? [record.sameAs] : [];
+        for (const item of sameAs.map(String)) {
+          if (!/^https?:\/\//i.test(item)) continue;
+          socialLinks.add(item); addContactSource(contactSources, { kind: 'social', value: item, sourceType: 'structured_data', sourceUrl });
+        }
+        const types = (Array.isArray(record['@type']) ? record['@type'] : [record['@type']]).map(String);
+        const name = typeof record.name === 'string' ? record.name.trim() : '';
+        if (name && types.some((type) => /Product|Service|Offer|MenuItem/i.test(type))) services.add(name.slice(0, 80));
+        const action = record.potentialAction && typeof record.potentialAction === 'object' ? record.potentialAction as Record<string, unknown> : undefined;
+        const actionType = String(action?.['@type'] ?? '');
+        if (/ReserveAction|ScheduleAction/i.test(actionType)) addCapabilityHit(capabilities.booking, sourceUrl, `${actionType} structured action`);
+        if (/BuyAction|OrderAction/i.test(actionType)) addCapabilityHit(capabilities.onlinePurchase, sourceUrl, `${actionType} structured action`);
+      }
+    } catch { /* ignore invalid JSON-LD */ }
+  });
+}
+
 export async function qualifyBusiness(candidate: BusinessCandidate, evidence?: Record<string, unknown>) {
+  const pagesCrawled = Number(evidence?.pages_crawled ?? 0);
   const fallback = opportunityFor(candidate, {
     hasBooking: Boolean(evidence?.has_booking), hasContactForm: Boolean(evidence?.has_contact_form),
+    hasPayment: Boolean(evidence?.has_payment), pagesCrawled,
   });
   const baseline = Math.min(98, 42 + (candidate.phone ? 10 : 0) + ((candidate.reviewCount ?? 0) > 30 ? 14 : 0)
-    + (!candidate.website ? 24 : 8) + (!evidence?.has_booking ? 6 : 0));
+    + (!candidate.website ? 24 : 8) + (pagesCrawled > 0 && evidence?.has_booking === false ? 6 : 0));
   const ruleResult = {
     qualified: baseline >= config.MIN_QUALIFICATION_SCORE, score: baseline, ...fallback,
     recommendedRole: 'Owner', rationale: buildQualificationRationale(candidate, evidence, fallback.painPoints), model: 'rules-live-fallback',
@@ -254,6 +407,8 @@ export async function qualifyBusiness(candidate: BusinessCandidate, evidence?: R
       recommended_role: { type: 'string' }, rationale: { type: 'string' },
     },
   };
+  const storedEvidence = evidence?.evidence && typeof evidence.evidence === 'object' ? evidence.evidence as Record<string, unknown> : {};
+  const capabilities = storedEvidence.capabilities && typeof storedEvidence.capabilities === 'object' ? storedEvidence.capabilities : undefined;
   const compactEvidence = evidence ? {
     title: evidence.title,
     description: evidence.description,
@@ -263,6 +418,7 @@ export async function qualifyBusiness(candidate: BusinessCandidate, evidence?: R
     hasBooking: evidence.has_booking,
     hasPayment: evidence.has_payment,
     pagesCrawled: evidence.pages_crawled,
+    capabilities,
     publicEmailsFound: Array.isArray(evidence.emails) ? evidence.emails.length : 0,
     publicPhonesFound: Array.isArray(evidence.phones) ? evidence.phones.length : 0,
     socialProfilesFound: Array.isArray(evidence.social_links) ? evidence.social_links.length : 0,
@@ -278,7 +434,7 @@ export async function qualifyBusiness(candidate: BusinessCandidate, evidence?: R
       method: 'POST', headers: { 'content-type': 'application/json' }, signal: AbortSignal.timeout(300_000),
       body: JSON.stringify({ model: config.OLLAMA_MODEL, stream: false, think: false, format: schema, keep_alive: 0,
         options: { temperature: 0.1, num_ctx: 2048, num_predict: 256 }, messages: [
-          { role: 'system', content: 'Qualify only from supplied evidence. Never invent facts. The rationale must clearly explain in 1-3 concise sentences why this business is or is not a potential client, citing observed website/business signals and the proposed opportunity. Return strict JSON.' },
+          { role: 'system', content: 'Qualify only from supplied evidence. Never invent facts. A capability with status detected may be stated as present. A not_detected capability means only that it was not seen on the checked pages; never claim the business definitely lacks it. Unknown means no conclusion is allowed. Do not infer purchasing, ecommerce, booking, contact forms, products, or services from a generic website description. The rationale must explain the opportunity in 1-3 concise sentences and use cautious evidence language. Return strict JSON.' },
           { role: 'user', content: JSON.stringify({ company: compactCompany, websiteEvidence: compactEvidence }) },
         ] }),
     });
@@ -286,11 +442,15 @@ export async function qualifyBusiness(candidate: BusinessCandidate, evidence?: R
     const data = await response.json() as { message?: { content?: string } };
     const parsed = JSON.parse(data.message?.content ?? '{}') as Record<string, unknown>;
     const score = Math.max(0, Math.min(100, Number(parsed.score ?? 0)));
+    const painPoints = normalizePainPoints(Array.isArray(parsed.pain_points) ? parsed.pain_points.map(String).slice(0, 5) : fallback.painPoints, pagesCrawled);
+    const aiRationale = String(parsed.rationale ?? '').trim();
+    const rationale = aiRationale && rationaleMatchesEvidence(aiRationale, capabilities)
+      ? aiRationale : buildQualificationRationale(candidate, evidence, painPoints);
     return {
       qualified: Boolean(parsed.qualified) && score >= config.MIN_QUALIFICATION_SCORE, score,
       opportunity: String(parsed.opportunity ?? fallback.opportunity),
-      painPoints: Array.isArray(parsed.pain_points) ? parsed.pain_points.map(String).slice(0, 5) : fallback.painPoints,
-      recommendedRole: String(parsed.recommended_role ?? 'Owner'), rationale: String(parsed.rationale ?? ''), model: config.OLLAMA_MODEL,
+      painPoints,
+      recommendedRole: String(parsed.recommended_role ?? 'Owner'), rationale, model: config.OLLAMA_MODEL,
     };
   } catch (error) {
     console.warn(`Ollama qualification unavailable for ${candidate.name}; using rule fallback:`, error instanceof Error ? error.message : error);
@@ -335,12 +495,24 @@ export async function researchPublicContacts(candidate: BusinessCandidate, evide
   }
   if (config.PROVIDER_MODE === 'safe') return { emails: [...emails], phones: [...phones], socialLinks: [...socialLinks], sources: [...sources.values()], searchResults: [] };
 
+  const socialPages = await Promise.allSettled([...socialLinks].slice(0, 4).map((url) => crawlPublicContactPage(url)));
+  for (const result of socialPages) {
+    if (result.status !== 'fulfilled') continue;
+    for (const email of result.value.emails) {
+      emails.add(email); addContactSource(sources, { kind: 'email', value: email, sourceType: 'social_profile', sourceUrl: result.value.url });
+    }
+    for (const phone of result.value.phones) {
+      phones.add(phone); addContactSource(sources, { kind: 'phone', value: phone, sourceType: 'social_profile', sourceUrl: result.value.url });
+    }
+  }
+
   const domain = normalizeDomain(candidate.website);
   const location = [candidate.city, candidate.country].filter(Boolean).join(' ');
   const queries = [
     `"${candidate.name}" email contact ${location}`,
     `"${candidate.name}" gmail phone ${location}`,
     `"${candidate.name}" owner founder director ${location}`,
+    `"${candidate.name}" (site:linkedin.com OR site:facebook.com OR site:instagram.com) contact ${location}`,
     ...(domain ? [`site:${domain} email contact`] : [`"${candidate.name}" facebook instagram ${location}`]),
   ];
   const settled = await Promise.allSettled(queries.map((query) => searchPublicWeb(query)));
@@ -366,6 +538,21 @@ export async function researchPublicContacts(candidate: BusinessCandidate, evide
     emails: [...emails].slice(0, 30), phones: [...phones].slice(0, 30), socialLinks: [...socialLinks].slice(0, 30),
     sources: [...sources.values()].slice(0, 100), searchResults,
   };
+}
+
+async function crawlPublicContactPage(url: string) {
+  if (!/^https?:\/\//i.test(url) || !/(?:linkedin|facebook|instagram|x\.com|twitter)\./i.test(url)) return { url, emails: [], phones: [] };
+  const response = await fetch(url, {
+    headers: { 'user-agent': 'Mozilla/5.0 (compatible; LeadForgePublicResearch/1.0)' },
+    redirect: 'follow', signal: AbortSignal.timeout(8_000),
+  });
+  if (!response.ok || !response.headers.get('content-type')?.includes('text/html')) return { url, emails: [], phones: [] };
+  const $ = load((await response.text()).slice(0, 500_000));
+  $('script,style,noscript,svg').remove();
+  const text = $('body').text().replace(/\s+/g, ' ').slice(0, 40_000);
+  const mailto = $('a[href^="mailto:"]').map((_, node) => $(node).attr('href')?.slice(7).split('?')[0] ?? '').get();
+  const telephone = $('a[href^="tel:"]').map((_, node) => $(node).attr('href')?.slice(4) ?? '').get();
+  return { url: response.url || url, emails: extractEmails(`${text} ${mailto.join(' ')}`), phones: extractPhones(`${text} ${telephone.join(' ')}`) };
 }
 
 export async function findDecisionMaker(candidate: BusinessCandidate, role = 'Owner', suppliedResults: PublicSearchResult[] = []) {
@@ -544,6 +731,10 @@ export function extractEmails(value: string): string[] {
 export function extractPhones(value: string): string[] {
   const found = new Set<string>();
   for (const match of value.matchAll(/(?:\+?\d|\(\d)[\d\s().-]{6,}\d/g)) {
+    const raw = match[0];
+    const context = value.slice(Math.max(0, (match.index ?? 0) - 28), (match.index ?? 0) + raw.length + 28);
+    const bareDigits = /^\d{8,15}$/.test(raw.trim());
+    if (bareDigits && !/phone|call|mobile|tel|contact|whats\s?app/i.test(context)) continue;
     const phone = normalizePhone(match[0]);
     if (phone) found.add(phone);
   }
@@ -573,13 +764,44 @@ function normalizeNameForComparison(value: string) {
 
 function buildQualificationRationale(candidate: BusinessCandidate, evidence: Record<string, unknown> | undefined, painPoints: string[]) {
   const signals: string[] = [];
+  const pagesCrawled = Number(evidence?.pages_crawled ?? 0);
   if (!candidate.website) signals.push('no business website was detected');
-  else if (!evidence?.has_booking) signals.push('the website has no detected online booking flow');
+  else if (pagesCrawled === 0) signals.push('the website could not yet be evaluated from public pages');
+  else if (evidence?.has_booking === false && painPoints.some((point) => /booking/i.test(point))) signals.push(`no online booking flow was detected on ${pagesCrawled} checked page${pagesCrawled === 1 ? '' : 's'}`);
   if (candidate.phone) signals.push('the business has a public contact number');
   if ((candidate.reviewCount ?? 0) >= 30) signals.push(`${candidate.reviewCount} Google reviews indicate an established active business`);
-  if (evidence?.has_contact_form === false) signals.push('no contact form was detected');
+  if (pagesCrawled > 0 && evidence?.has_contact_form === false) signals.push('no contact form was detected on the checked pages');
   const observed = signals.slice(0, 3).join('; ') || 'the available public evidence is limited';
   return `Potential-client assessment: ${observed}. The clearest opportunity is ${painPoints[0]?.toLowerCase() ?? 'a review of the website conversion path'}.`;
+}
+
+function normalizePainPoints(values: string[], pagesCrawled: number) {
+  const checkedPages = `on ${pagesCrawled} checked page${pagesCrawled === 1 ? '' : 's'}`;
+  return values.map((value) => {
+    if (pagesCrawled === 0 && /booking|payment|purchase|contact form|e-?commerce/i.test(value)) return 'Website capability could not be confirmed from public pages';
+    if (/^(?:no|missing|lacks?)\b.*booking/i.test(value)) return `No online booking flow detected ${checkedPages}`;
+    if (/^(?:no|missing|lacks?)\b.*contact form/i.test(value)) return `No contact form detected ${checkedPages}`;
+    if (/^(?:no|missing|lacks?)\b.*(?:payment|purchase|checkout|e-?commerce)/i.test(value)) return `No online purchase or payment flow detected ${checkedPages}`;
+    return value;
+  });
+}
+
+function rationaleMatchesEvidence(value: string, capabilities: unknown) {
+  const record = capabilities && typeof capabilities === 'object' ? capabilities as Record<string, unknown> : {};
+  const status = (key: string) => {
+    const signal = record[key];
+    return signal && typeof signal === 'object' ? String((signal as Record<string, unknown>).status ?? 'unknown') : 'unknown';
+  };
+  const unsupportedPresence = (key: string, term: RegExp) => status(key) !== 'detected'
+    && new RegExp(`\\b(?:has|offers?|supports?|provides?|includes?|allows?|features?)\\b.{0,55}${term.source}`, 'i').test(value);
+  const unsupportedAbsence = (key: string, term: RegExp) => status(key) !== 'detected'
+    && new RegExp(`\\b(?:lacks?|without|does not have|has no)\\b.{0,45}${term.source}`, 'i').test(value);
+  return !unsupportedPresence('booking', /(?:online )?(?:booking|appointment|scheduling)/i)
+    && !unsupportedPresence('onlinePurchase', /(?:online )?(?:purchase|checkout|payment|store|shop|e-?commerce)/i)
+    && !unsupportedPresence('contactForm', /contact form/i)
+    && !unsupportedAbsence('booking', /(?:booking|appointment|scheduling)/i)
+    && !unsupportedAbsence('onlinePurchase', /(?:purchase|checkout|payment|store|shop|e-?commerce)/i)
+    && !unsupportedAbsence('contactForm', /contact form/i);
 }
 
 function titleCase(value: string) { return value.replace(/\b\w/g, (letter) => letter.toUpperCase()); }

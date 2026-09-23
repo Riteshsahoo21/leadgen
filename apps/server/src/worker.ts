@@ -16,7 +16,7 @@ type RunJob = { runId: string };
 type CompanyJob = RunJob & { companyId: string };
 
 const workers: Worker[] = [];
-const refreshCounters = new Map<string, number>();
+const refreshCounters = new Map<string, { count: number; refreshedAt: number }>();
 
 function addWorker(name: string, processor: (job: Job) => Promise<unknown>, concurrency: number, limiter?: { max: number; duration: number }) {
   const worker = new Worker(name, processor, { connection, concurrency, ...(limiter ? { limiter } : {}) });
@@ -212,9 +212,13 @@ function fromCompany(company: Record<string, any>): BusinessCandidate {
 }
 
 async function maybeRefresh(runId: string) {
-  const next = (refreshCounters.get(runId) ?? 0) + 1;
+  const previous = refreshCounters.get(runId) ?? { count: 0, refreshedAt: 0 };
+  const next = { count: previous.count + 1, refreshedAt: previous.refreshedAt };
+  if (next.count % 25 === 0 || Date.now() - next.refreshedAt >= 5_000) {
+    await refreshRunStats(runId);
+    next.refreshedAt = Date.now();
+  }
   refreshCounters.set(runId, next);
-  if (next % 25 === 0) await refreshRunStats(runId);
 }
 
 async function finishOne(runId: string) {

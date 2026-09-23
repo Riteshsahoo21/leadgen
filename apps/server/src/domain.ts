@@ -72,11 +72,18 @@ export function calculateFilterScore(candidate: BusinessCandidate): { score: num
   return { score: Math.min(score, 100), reasons };
 }
 
-export function opportunityFor(candidate: BusinessCandidate, evidence?: { hasBooking?: boolean; hasContactForm?: boolean }) {
+export function opportunityFor(candidate: BusinessCandidate, evidence?: { hasBooking?: boolean; hasContactForm?: boolean; hasPayment?: boolean; pagesCrawled?: number }) {
   if (!candidate.website) return { opportunity: 'new_website', painPoints: ['No detected website'] };
   const painPoints: string[] = [];
-  if (!evidence?.hasBooking) painPoints.push('No online booking detected');
-  if (!evidence?.hasContactForm) painPoints.push('No contact form detected');
+  const checked = (evidence?.pagesCrawled ?? 0) > 0;
+  const commerceRelevant = /restaurant|retail|store|shop|e-?commerce|product|clothing|garment|food|bakery|hotel|manufacturer/i
+    .test(`${candidate.category ?? ''} ${(candidate.categories ?? []).join(' ')}`);
+  const bookingRelevant = /dentist|clinic|doctor|salon|spa|hotel|restaurant|consult|agency|repair|service|contractor|law|account|real estate|fitness/i
+    .test(`${candidate.category ?? ''} ${(candidate.categories ?? []).join(' ')}`);
+  if (checked && bookingRelevant && evidence?.hasBooking === false) painPoints.push('No online booking flow detected on checked pages');
+  if (checked && evidence?.hasContactForm === false) painPoints.push('No contact form detected on checked pages');
+  if (checked && commerceRelevant && evidence?.hasPayment === false) painPoints.push('No online purchase or payment flow detected on checked pages');
+  if (!checked) painPoints.push('Website capabilities could not yet be confirmed');
   if (painPoints.length === 0) painPoints.push('Website conversion path can be reviewed');
   return { opportunity: 'website_improvement', painPoints };
 }

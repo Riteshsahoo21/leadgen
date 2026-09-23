@@ -1,10 +1,11 @@
 import {
   ArrowLeft, ExternalLink, Globe2, Mail, MapPin, Phone, RefreshCw, Share2, UserRound,
 } from 'lucide-react';
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useState } from 'react';
 import { Link, useParams } from 'react-router-dom';
 import { api, type Lead, type Message, type Qualification } from '../api';
 import { Badge, EmptyState, LoadingRows, PageHeader, Panel, Score } from '../components/Ui';
+import { usePolling } from '../hooks/usePolling';
 
 type ContactSource = {
   kind: 'email' | 'phone' | 'social';
@@ -13,14 +14,28 @@ type ContactSource = {
   sourceUrl?: string;
 };
 
+type CapabilitySignal = {
+  status: 'detected' | 'not_detected' | 'unknown';
+  sourceUrls?: string[];
+  evidence?: string[];
+};
+
 type Detail = Lead & {
   qualification?: Qualification;
   website_evidence?: {
+    about?: string;
+    services?: string[];
     emails?: string[];
     phones?: string[];
     social_links?: string[];
     contact_sources?: ContactSource[];
-    evidence?: { publicContactSources?: ContactSource[] };
+    pages_crawled?: number;
+    crawled_at?: string;
+    evidence?: {
+      publicContactSources?: ContactSource[];
+      capabilities?: Record<'contactForm' | 'booking' | 'onlinePurchase', CapabilitySignal>;
+      pages?: Array<{ url: string; title?: string }>;
+    };
     [key: string]: unknown;
   };
   contacts: Array<{ id: string; full_name: string; role?: string; source_url?: string; confidence: number }>;
@@ -52,7 +67,7 @@ export function BusinessDetailPage() {
   const load = useCallback(() => api<{ business: Detail }>(`/api/businesses/${id}`)
     .then((value) => setBusiness(value.business))
     .catch((reason) => setError(reason instanceof Error ? reason.message : String(reason))), [id]);
-  useEffect(() => { void load(); }, [load]);
+  usePolling(load, 5_000, id);
 
   if (error) return <div className="alert">{error}</div>;
   if (!business) return <LoadingRows count={8} />;
@@ -83,7 +98,7 @@ export function BusinessDetailPage() {
       eyebrow={business.category ?? 'BUSINESS'}
       title={business.name}
       description={`${business.city ?? ''}${business.city ? ', ' : ''}${business.country}`}
-      actions={<><Badge value={business.status} /><button className="button button-secondary" disabled={refreshing} onClick={refreshResearch}><RefreshCw size={14} />{refreshing ? 'Queued…' : 'Refresh contacts'}</button></>}
+      actions={<><Badge value={business.status} /><button className="button button-secondary" disabled={refreshing} onClick={refreshResearch}><RefreshCw size={14} />{refreshing ? 'Queued…' : 'Refresh analysis & contacts'}</button></>}
     />
 
     <section className="detail-grid">
@@ -120,8 +135,22 @@ export function BusinessDetailPage() {
       <div className="record-list">{emailRows.map((email) => <div key={email.email}><i><Mail size={16} /></i><div><strong>{email.email}</strong><small>{sourceLabel(email.sourceType ?? email.method)} · {email.confidence}% confidence</small></div>{email.sourceUrl && <a href={email.sourceUrl} target="_blank" rel="noreferrer"><ExternalLink size={15} /></a>}<Badge value={email.status} /></div>)}{!emailRows.length && <EmptyState icon={Mail} title="No public email yet" detail="Contact research checks Google Maps output, the company site, search snippets and public social profiles." />}</div>
     </Panel></section>
 
-    <section className="detail-section"><Panel title="Website evidence" subtitle="Compact signals retained from crawling"><pre className="evidence-block">{JSON.stringify(evidence ?? { note: 'No website evidence available' }, null, 2)}</pre></Panel></section>
+    <section className="detail-section"><Panel title="Website analysis" subtitle={evidence ? `${evidence.pages_crawled ?? 0} public pages checked` : 'No crawl evidence yet'}>
+      <div className="capability-grid">
+        <CapabilityCard label="Contact form" signal={evidence?.evidence?.capabilities?.contactForm} />
+        <CapabilityCard label="Booking flow" signal={evidence?.evidence?.capabilities?.booking} />
+        <CapabilityCard label="Online purchase" signal={evidence?.evidence?.capabilities?.onlinePurchase} />
+      </div>
+      {evidence?.about && <div className="analysis-copy"><strong>Observed website summary</strong><p>{evidence.about}</p></div>}
+      {!!evidence?.services?.length && <div className="analysis-copy"><strong>Services and products observed</strong><div className="tag-list">{evidence.services.map((item) => <span key={item}>{item}</span>)}</div></div>}
+      {!!evidence?.evidence?.pages?.length && <div className="analysis-copy"><strong>Pages used as evidence</strong><div className="source-links">{evidence.evidence.pages.map((page) => <a key={page.url} href={page.url} target="_blank" rel="noreferrer">{page.title || page.url}<ExternalLink size={12} /></a>)}</div></div>}
+    </Panel></section>
   </>;
+}
+
+function CapabilityCard({ label, signal }: { label: string; signal?: CapabilitySignal }) {
+  const status = signal?.status ?? 'unknown';
+  return <article className="capability-card"><div><strong>{label}</strong><Badge value={status} /></div><p>{status === 'detected' ? signal?.evidence?.[0] ?? 'Direct page evidence detected.' : status === 'not_detected' ? 'Not detected on the pages that were checked.' : 'Not enough crawl evidence to determine this.'}</p>{signal?.sourceUrls?.[0] && <a href={signal.sourceUrls[0]} target="_blank" rel="noreferrer">View source <ExternalLink size={12} /></a>}</article>;
 }
 
 function buildEmailRows(stored: Detail['emails'], publicEmails: string[], sources: ContactSource[]): EmailRow[] {
@@ -154,7 +183,8 @@ function parseProviderList(value: unknown): string[] {
 function sourceLabel(value: string) {
   const labels: Record<string, string> = {
     google_maps: 'Google Maps', company_website: 'Company website', public_search: 'Public search result',
-    social_search: 'Public social profile', generated_pattern: 'Generated pattern', pattern_and_mx: 'Generated pattern + MX',
+    structured_data: 'Website structured data', social_profile: 'Public social profile page',
+    social_search: 'Public social search result', generated_pattern: 'Generated pattern', pattern_and_mx: 'Generated pattern + MX',
   };
   return labels[value] ?? value.replaceAll('_', ' ');
 }

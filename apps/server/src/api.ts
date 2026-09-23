@@ -75,12 +75,14 @@ app.get<{ Params: { id: string } }>('/api/businesses/:id', async (request, reply
 });
 
 app.post<{ Params: { id: string } }>('/api/businesses/:id/research', async (request, reply) => {
-  const result = await pool.query('SELECT id,run_id FROM companies WHERE id=$1', [request.params.id]);
+  const result = await pool.query('SELECT id,run_id,website FROM companies WHERE id=$1', [request.params.id]);
   const company = result.rows[0];
   if (!company) return reply.code(404).send({ error: 'Business not found' });
-  await pool.query("UPDATE companies SET status='research_queued' WHERE id=$1", [company.id]);
-  await enqueue('research', 'refresh-public-contacts', { runId: company.run_id, companyId: company.id });
-  return reply.code(202).send({ status: 'research_queued' });
+  const queue = company.website ? 'crawl' : 'qualify';
+  const status = company.website ? 'crawl_queued' : 'qualify_queued';
+  await pool.query('UPDATE companies SET status=$2 WHERE id=$1', [company.id, status]);
+  await enqueue(queue, 'refresh-analysis', { runId: company.run_id, companyId: company.id });
+  return reply.code(202).send({ status });
 });
 
 const backfillSchema = z.object({ limit: z.coerce.number().int().min(1).max(500).default(100) });
@@ -96,6 +98,22 @@ app.post('/api/research/backfill', async (request, reply) => {
   for (const company of result.rows) {
     await pool.query("UPDATE companies SET status='research_queued' WHERE id=$1", [company.id]);
     await enqueue('research', 'backfill-public-contacts', { runId: company.run_id, companyId: company.id });
+  }
+  return reply.code(202).send({ queued: result.rowCount ?? 0 });
+});
+
+app.post('/api/analysis/backfill', async (request, reply) => {
+  const parsed = backfillSchema.safeParse(request.body ?? {});
+  if (!parsed.success) return reply.code(400).send({ error: 'Invalid analysis backfill request', issues: parsed.error.issues });
+  const result = await pool.query(
+    `SELECT c.id,c.run_id FROM companies c
+     WHERE c.website IS NOT NULL AND length(c.website)>0
+       AND c.status NOT IN ('crawl_queued','qualify_queued','research_queued','enrich_queued')
+     ORDER BY c.updated_at DESC LIMIT $1`, [parsed.data.limit],
+  );
+  for (const company of result.rows) {
+    await pool.query("UPDATE companies SET status='crawl_queued' WHERE id=$1", [company.id]);
+    await enqueue('crawl', 'refresh-analysis', { runId: company.run_id, companyId: company.id });
   }
   return reply.code(202).send({ queued: result.rowCount ?? 0 });
 });

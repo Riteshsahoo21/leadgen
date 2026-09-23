@@ -1,15 +1,22 @@
 import { BrainCircuit, CheckCircle2, XCircle } from 'lucide-react';
-import { useEffect, useMemo, useState } from 'react';
+import { useMemo, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { api, queryString, type Qualification } from '../api';
 import { Badge, EmptyState, LoadingRows, PageHeader, Panel, Score, StatCard } from '../components/Ui';
+import { usePolling } from '../hooks/usePolling';
 
 export function QualificationPage() {
   const [items, setItems] = useState<Qualification[]>([]);
   const [filter, setFilter] = useState('all');
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
-  useEffect(() => { setLoading(true); api<{ qualifications: Qualification[] }>(`/api/qualifications${queryString({ qualified: filter === 'all' ? undefined : filter === 'qualified', limit: 200 })}`).then((value) => setItems(value.qualifications)).catch((reason) => setError(reason.message)).finally(() => setLoading(false)); }, [filter]);
+  usePolling(async () => {
+    try {
+      const value = await api<{ qualifications: Qualification[] }>(`/api/qualifications${queryString({ qualified: filter === 'all' ? undefined : filter === 'qualified', limit: 200 })}`);
+      setItems(value.qualifications); setError('');
+    } catch (reason) { setError(reason instanceof Error ? reason.message : String(reason)); }
+    finally { setLoading(false); }
+  }, 5_000, filter);
   const stats = useMemo(() => ({ qualified: items.filter((item) => item.qualified).length, rejected: items.filter((item) => !item.qualified).length, average: items.length ? Math.round(items.reduce((sum, item) => sum + item.score, 0) / items.length) : 0 }), [items]);
   return <>
     <PageHeader eyebrow="AI EVALUATION" title="Qualification" description="See why each business is—or is not—a potential client, with observed evidence behind every score." />

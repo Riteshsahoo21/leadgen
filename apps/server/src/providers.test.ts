@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { extractEmails, extractPhones, parseStringList } from './providers.js';
+import { extractEmails, extractEvidence, extractPhones, mapsDepthFor, parseStringList } from './providers.js';
 
 describe('public contact extraction', () => {
   it('normalizes Maps email arrays and separated values', () => {
@@ -13,5 +13,26 @@ describe('public contact extraction', () => {
 
   it('extracts and normalizes public phone numbers', () => {
     expect(extractPhones('Call +91 98765 43210 or (06762) 221-900')).toEqual(['+919876543210', '06762221900']);
+  });
+
+  it('scales Maps depth with the requested volume and query count', () => {
+    expect(mapsDepthFor(100, 10)).toBe(1);
+    expect(mapsDepthFor(2_000, 12)).toBe(10);
+  });
+
+  it('requires direct purchase controls instead of payment-provider mentions', () => {
+    const candidate = { name: 'Acme', country: 'India', website: 'https://acme.test' };
+    const mentionOnly = extractEvidence([{ url: candidate.website, html: '<html><body>Payments may be handled by PayPal.</body></html>' }], candidate);
+    expect(mentionOnly.capabilities.onlinePurchase.status).toBe('not_detected');
+    const checkout = extractEvidence([{ url: candidate.website, html: '<html><body><a href="/checkout">Buy now</a></body></html>' }], candidate);
+    expect(checkout.capabilities.onlinePurchase.status).toBe('detected');
+  });
+
+  it('extracts contacts and social profiles from structured website data', () => {
+    const candidate = { name: 'Acme', country: 'India', website: 'https://acme.test' };
+    const evidence = extractEvidence([{ url: candidate.website, html: '<script type="application/ld+json">{"@type":"Organization","email":"hello@acme.test","telephone":"+91 98765 43210","sameAs":["https://instagram.com/acme"]}</script><body>Acme</body>' }], candidate);
+    expect(evidence.emails).toContain('hello@acme.test');
+    expect(evidence.phones).toContain('+919876543210');
+    expect(evidence.socialLinks).toContain('https://instagram.com/acme');
   });
 });

@@ -1,13 +1,17 @@
 import { FileText, LockKeyhole, Mail } from 'lucide-react';
-import { useEffect, useState } from 'react';
+import { useState } from 'react';
 import { api, type AppConfig, type Message } from '../api';
 import { Badge, EmptyState, LoadingRows, PageHeader, Panel, relativeTime } from '../components/Ui';
+import { usePolling } from '../hooks/usePolling';
 
 export function CampaignsPage() {
   const [messages, setMessages] = useState<Message[]>([]);
   const [config, setConfig] = useState<AppConfig>();
   const [loading, setLoading] = useState(true);
-  useEffect(() => { Promise.all([api<{ messages: Message[] }>('/api/messages?direction=outbound&limit=200'), api<AppConfig>('/api/config')]).then(([messageResult, configResult]) => { setMessages(messageResult.messages); setConfig(configResult); }).finally(() => setLoading(false)); }, []);
+  usePolling(async () => {
+    const [messageResult, configResult] = await Promise.all([api<{ messages: Message[] }>('/api/messages?direction=outbound&limit=200'), api<AppConfig>('/api/config')]);
+    setMessages(messageResult.messages); setConfig(configResult); setLoading(false);
+  });
   return <>
     <PageHeader eyebrow="OUTREACH WORKSPACE" title="Campaigns" description="Review generated drafts and delivery state. Sending stays locked until mail services are explicitly enabled." />
     <div className={`safety-banner ${config?.emailSending ? 'safety-live' : ''}`}><LockKeyhole size={20} /><div><strong>{config?.emailSending ? 'Email sending enabled' : 'Email sending is safely disabled'}</strong><p>{config?.emailSending ? `Daily limit: ${config.dailySendLimit}` : 'Research and enrichment work normally, but no email can leave this system.'}</p></div><Badge value={config?.pipelineStopAfter ?? 'loading'} /></div>

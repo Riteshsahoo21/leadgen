@@ -1,8 +1,9 @@
 import { Building2, ExternalLink, Search } from 'lucide-react';
-import { useEffect, useState } from 'react';
+import { useState } from 'react';
 import { Link, useSearchParams } from 'react-router-dom';
 import { api, queryString, type Lead } from '../api';
 import { Badge, EmptyState, LoadingRows, PageHeader, Panel, Score } from '../components/Ui';
+import { usePolling } from '../hooks/usePolling';
 
 type Response = { items: Lead[]; total: number; limit: number; offset: number };
 
@@ -14,12 +15,13 @@ export function BusinessesPage() {
   const search = params.get('search') ?? '';
   const status = params.get('status') ?? '';
 
-  useEffect(() => {
-    let active = true;
-    setLoading(true);
-    api<Response>(`/api/businesses${queryString({ search, status, limit: 100 })}`).then((response) => active && setData(response)).catch((reason) => active && setError(reason.message)).finally(() => active && setLoading(false));
-    return () => { active = false; };
-  }, [search, status]);
+  usePolling(async () => {
+    try {
+      const response = await api<Response>(`/api/businesses${queryString({ search, status, limit: 100 })}`);
+      setData(response); setError('');
+    } catch (reason) { setError(reason instanceof Error ? reason.message : String(reason)); }
+    finally { setLoading(false); }
+  }, 5_000, `${search}:${status}`);
 
   return <>
     <PageHeader eyebrow="LEAD DATABASE" title="Businesses" description={`${data.total.toLocaleString()} companies collected across all discovery runs.`} />
