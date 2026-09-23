@@ -25,13 +25,23 @@ chmod +x scripts/*.sh
 ./scripts/bootstrap.sh leads.example.com mail.example.com admin@example.com hello@example.com
 ```
 
-The four arguments are the dashboard domain, Posta domain, Posta administrator email, and sender address. The bootstrap script creates `.env`, generates random secrets, validates the Compose file, builds the application, downloads images/model, starts the services, and prints their status. Before public use, review these values:
+The four arguments are the dashboard host, Posta host, Posta administrator email, and sender address. A domain is optional for an initial safe-mode test. Without one, pass the VPS IP twice:
+
+```bash
+./scripts/bootstrap.sh 203.0.113.10 203.0.113.10 admin@example.com hello@example.com
+```
+
+This exposes the dashboard at `http://203.0.113.10` and Posta at `http://203.0.113.10:9000`. IP mode deliberately uses plain HTTP and must not be used for real email sending. Add domains before enabling live campaigns so Caddy can issue trusted certificates and email DNS can be configured.
+
+The bootstrap script creates `.env`, generates random secrets, validates the Compose file, builds the application, downloads images/model, starts the services, and prints their status. Before public use, review these values:
 
 The proxy importer accepts Webshare's `host:port:user:password` format or complete `http://`, `https://`, and SOCKS proxy URLs. It writes a normalized, mode-`600` file to `secrets/gmaps-proxies.txt`. That directory is excluded from Git and Docker build contexts. Compose mounts the file read-only only into the Maps scraper, so these proxies are used for initial Google Maps discovery and not for website crawling, AI, search, or email delivery.
 
 ```dotenv
 DOMAIN=leads.example.com
+APP_URL=https://leads.example.com
 POSTA_DOMAIN=mail.example.com
+POSTA_PUBLIC_URL=https://mail.example.com
 POSTA_FROM=hello@example.com
 POSTA_ADMIN_EMAIL=admin@example.com
 PROVIDER_MODE=safe

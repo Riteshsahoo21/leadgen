@@ -1,4 +1,4 @@
-{$DOMAIN:localhost} {
+{$APP_URL:http://localhost} {
   encode zstd gzip
 
   handle /api/* {
@@ -18,7 +18,7 @@
   }
 }
 
-{$POSTA_DOMAIN:posta.localhost} {
+{$POSTA_PUBLIC_URL:http://localhost:9000} {
   encode zstd gzip
   reverse_proxy posta:9000
 }

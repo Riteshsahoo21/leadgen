@@ -17,8 +17,9 @@ if [ -f .env ]; then
   echo ".env already exists; leaving your configuration unchanged."
 else
   if [ "$#" -ne 4 ]; then
-    echo "Usage: $0 leads.example.com mail.example.com admin@example.com hello@example.com" >&2
-    echo "Arguments: dashboard domain, Posta domain, Posta admin email, sender email" >&2
+    echo "Usage with domains: $0 leads.example.com mail.example.com admin@example.com hello@example.com" >&2
+    echo "Usage without domains: $0 YOUR_VPS_IP YOUR_VPS_IP admin@example.com hello@example.com" >&2
+    echo "Arguments: dashboard host, Posta host, Posta admin email, sender email" >&2
     exit 1
   fi
   app_domain="$1"
@@ -30,6 +31,13 @@ else
   done
   echo "$posta_admin_email" | grep -Eq '^[^[:space:]@]+@[^[:space:]@]+$' || { echo "Invalid admin email" >&2; exit 1; }
   echo "$posta_from" | grep -Eq '^[^[:space:]@]+@[^[:space:]@]+$' || { echo "Invalid sender email" >&2; exit 1; }
+  if echo "$app_domain" | grep -Eq '^([0-9]{1,3}\.){3}[0-9]{1,3}$|^localhost$'; then
+    app_url="http://${app_domain}"
+    posta_public_url="http://${app_domain}:9000"
+  else
+    app_url="https://${app_domain}"
+    posta_public_url="https://${posta_domain}"
+  fi
   cp .env.example .env
   api_token="$(openssl rand -hex 32)"
   postgres_password="$(openssl rand -hex 24)"
@@ -48,6 +56,8 @@ else
   sed -i "s|POSTA_ENCRYPTION_KEY=change-me-with-32-bytes-of-random-data|POSTA_ENCRYPTION_KEY=${posta_encryption_key}|" .env
   sed -i "s|DOMAIN=localhost|DOMAIN=${app_domain}|" .env
   sed -i "s|POSTA_DOMAIN=posta.example.com|POSTA_DOMAIN=${posta_domain}|" .env
+  sed -i "s|APP_URL=http://localhost|APP_URL=${app_url}|" .env
+  sed -i "s|POSTA_PUBLIC_URL=http://localhost:9000|POSTA_PUBLIC_URL=${posta_public_url}|" .env
   sed -i "s|POSTA_ADMIN_EMAIL=admin@example.com|POSTA_ADMIN_EMAIL=${posta_admin_email}|" .env
   sed -i "s|POSTA_FROM=hello@example.com|POSTA_FROM=${posta_from}|" .env
   chmod 600 .env
@@ -60,5 +70,5 @@ docker compose up -d --build
 docker compose ps
 
 echo
-echo "LeadForge is starting. Open https://$(sed -n 's/^DOMAIN=//p' .env | tail -1)"
+echo "LeadForge is starting. Open $(sed -n 's/^APP_URL=//p' .env | tail -1)"
 echo "Use the API_TOKEN from .env when the dashboard asks for it."

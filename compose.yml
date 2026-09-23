@@ -4,7 +4,7 @@ x-server-env: &server-env
   NODE_ENV: production
   API_PORT: 3001
   API_TOKEN: ${API_TOKEN:?Set API_TOKEN in .env}
-  APP_ORIGIN: https://${DOMAIN:-localhost}
+  APP_ORIGIN: ${APP_URL:-http://localhost}
   DATABASE_URL: postgres://${POSTGRES_USER:-leadforge}:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-leadforge}
   REDIS_URL: redis://redis:6379
   PROVIDER_MODE: ${PROVIDER_MODE:-safe}
@@ -123,12 +123,13 @@ services:
   caddy:
     image: caddy:2.10-alpine
     environment:
-      DOMAIN: ${DOMAIN:-localhost}
-      POSTA_DOMAIN: ${POSTA_DOMAIN:-posta.localhost}
+      APP_URL: ${APP_URL:-http://localhost}
+      POSTA_PUBLIC_URL: ${POSTA_PUBLIC_URL:-http://localhost:9000}
     ports:
       - "80:80"
       - "443:443"
       - "443:443/udp"
+      - "9000:9000"
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy_data:/data
@@ -250,8 +251,8 @@ services:
       POSTA_JWT_SECRET: ${POSTA_JWT_SECRET:?Set POSTA_JWT_SECRET}
       POSTA_ADMIN_EMAIL: ${POSTA_ADMIN_EMAIL:?Set POSTA_ADMIN_EMAIL}
       POSTA_ADMIN_PASSWORD: ${POSTA_ADMIN_PASSWORD:?Set POSTA_ADMIN_PASSWORD}
-      POSTA_WEB_URL: https://${POSTA_DOMAIN}
-      POSTA_CORS_ORIGINS: https://${POSTA_DOMAIN}
+      POSTA_WEB_URL: ${POSTA_PUBLIC_URL}
+      POSTA_CORS_ORIGINS: ${POSTA_PUBLIC_URL}
       POSTA_EMBEDDED_WORKER: "true"
       POSTA_WORKER_CONCURRENCY: "1"
       POSTA_RATE_LIMIT_DAILY: ${DAILY_SEND_LIMIT:-100}
