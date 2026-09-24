@@ -72,18 +72,116 @@ export function calculateFilterScore(candidate: BusinessCandidate): { score: num
   return { score: Math.min(score, 100), reasons };
 }
 
-export function opportunityFor(candidate: BusinessCandidate, evidence?: { hasBooking?: boolean; hasContactForm?: boolean; hasPayment?: boolean; pagesCrawled?: number }) {
-  if (!candidate.website) return { opportunity: 'new_website', painPoints: ['No detected website'] };
+export type QualificationEvidence = {
+  hasBooking?: boolean;
+  hasContactForm?: boolean;
+  hasPayment?: boolean;
+  pagesCrawled?: number;
+  publicEmails?: number;
+  publicPhones?: number;
+  socialProfiles?: number;
+  crawlFailed?: boolean;
+};
+
+export type QualificationScoreBreakdown = {
+  need: number;
+  businessStrength: number;
+  reachability: number;
+  evidenceQuality: number;
+  penalty: number;
+  total: number;
+  signals: string[];
+};
+
+export function calculateQualificationScore(candidate: BusinessCandidate, evidence: QualificationEvidence = {}) {
+  const pagesCrawled = Math.max(0, Number(evidence.pagesCrawled ?? 0));
+  const category = `${candidate.category ?? ''} ${(candidate.categories ?? []).join(' ')}`;
+  const bookingRelevant = /dentist|clinic|doctor|salon|spa|hotel|restaurant|consult|agency|repair|service|contractor|law|account|real estate|fitness/i.test(category);
+  const commerceRelevant = /restaurant|retail|store|shop|e-?commerce|clothing|garment|food|bakery|delivery/i.test(category);
   const painPoints: string[] = [];
-  const checked = (evidence?.pagesCrawled ?? 0) > 0;
-  const commerceRelevant = /restaurant|retail|store|shop|e-?commerce|product|clothing|garment|food|bakery|hotel|manufacturer/i
-    .test(`${candidate.category ?? ''} ${(candidate.categories ?? []).join(' ')}`);
-  const bookingRelevant = /dentist|clinic|doctor|salon|spa|hotel|restaurant|consult|agency|repair|service|contractor|law|account|real estate|fitness/i
-    .test(`${candidate.category ?? ''} ${(candidate.categories ?? []).join(' ')}`);
-  if (checked && bookingRelevant && evidence?.hasBooking === false) painPoints.push('No online booking flow detected on checked pages');
-  if (checked && evidence?.hasContactForm === false) painPoints.push('No contact form detected on checked pages');
-  if (checked && commerceRelevant && evidence?.hasPayment === false) painPoints.push('No online purchase or payment flow detected on checked pages');
-  if (!checked) painPoints.push('Website capabilities could not yet be confirmed');
-  if (painPoints.length === 0) painPoints.push('Website conversion path can be reviewed');
-  return { opportunity: 'website_improvement', painPoints };
+  const signals: string[] = [];
+  let opportunity = 'website_present';
+  let need = 0;
+
+  if (!candidate.website) {
+    opportunity = 'new_website';
+    need = 40;
+    painPoints.push('No detected website');
+    signals.push('No website creates a clear build opportunity');
+  } else if (evidence.crawlFailed || pagesCrawled === 0) {
+    opportunity = 'manual_review';
+    need = 12;
+    painPoints.push('Website could not be evaluated from public pages');
+    signals.push('Website evidence is incomplete, so the lead needs manual review');
+  } else {
+    const gaps: Array<{ points: number; painPoint: string; signal: string }> = [];
+    if (evidence.hasContactForm === false) gaps.push({
+      points: 16,
+      painPoint: `No contact form detected on ${pagesCrawled} checked page${pagesCrawled === 1 ? '' : 's'}`,
+      signal: 'No direct website enquiry form was detected',
+    });
+    if (bookingRelevant && evidence.hasBooking === false) gaps.push({
+      points: 12,
+      painPoint: `No online booking flow detected on ${pagesCrawled} checked page${pagesCrawled === 1 ? '' : 's'}`,
+      signal: 'A booking-oriented business has no detected online booking flow',
+    });
+    if (commerceRelevant && evidence.hasPayment === false) gaps.push({
+      points: 12,
+      painPoint: `No online ordering or purchase flow detected on ${pagesCrawled} checked page${pagesCrawled === 1 ? '' : 's'}`,
+      signal: 'A commerce-oriented business has no detected purchase flow',
+    });
+    if (gaps.length) {
+      opportunity = 'website_improvement';
+      need = Math.min(40, 8 + gaps.reduce((sum, gap) => sum + gap.points, 0));
+      painPoints.push(...gaps.map((gap) => gap.painPoint));
+      signals.push(...gaps.map((gap) => gap.signal));
+    } else {
+      painPoints.push('No clear website conversion gap detected on checked pages');
+      signals.push('The checked pages already expose the relevant conversion paths');
+    }
+  }
+
+  const reviews = Math.max(0, candidate.reviewCount ?? 0);
+  // Log scaling prevents very large review counts from overwhelming every other signal.
+  const reviewStrength = Math.round(14 * Math.log1p(Math.min(reviews, 2_000)) / Math.log1p(2_000));
+  // Bayesian shrinkage prevents a five-star business with only a few reviews from outranking established businesses.
+  const priorRating = 3.8;
+  const priorReviews = 20;
+  const adjustedRating = candidate.rating == null
+    ? priorRating
+    : ((candidate.rating * reviews) + (priorRating * priorReviews)) / (reviews + priorReviews);
+  const ratingStrength = Math.round(10 * clamp((adjustedRating - 3.2) / 1.6, 0, 1));
+  const locationStrength = candidate.address ? 3 : 0;
+  const businessStrength = reviewStrength + ratingStrength + locationStrength;
+  if (reviews) signals.push(`${reviews} reviews contribute ${reviewStrength} traction points`);
+  if (candidate.rating != null) signals.push(`Bayesian-adjusted rating ${adjustedRating.toFixed(2)}/5`);
+
+  const publicEmails = Math.max(candidate.publicEmails?.length ?? 0, evidence.publicEmails ?? 0);
+  const publicPhones = Math.max(candidate.phone ? 1 : 0, evidence.publicPhones ?? 0);
+  const socialProfiles = Math.max(0, evidence.socialProfiles ?? 0);
+  const reachability = Math.min(20,
+    (publicPhones ? 8 : 0) + (publicEmails ? 8 : 0) + (socialProfiles ? 2 : 0) + (evidence.hasContactForm ? 2 : 0));
+  if (publicEmails) signals.push('A public email improves contactability');
+  if (publicPhones) signals.push('A public phone improves contactability');
+
+  const evidenceQuality = Math.min(13,
+    (candidate.sourceId ? 2 : 0) + (candidate.address ? 2 : 0) + Math.min(7, pagesCrawled * 2) + ((publicEmails || publicPhones) ? 2 : 0));
+  const penalty = evidence.crawlFailed ? 10 : 0;
+  let total = Math.round(clamp(need + businessStrength + reachability + evidenceQuality - penalty, 0, 100));
+  if (opportunity === 'website_present') total = Math.min(total, 49);
+  if (opportunity === 'manual_review') total = Math.min(total, 55);
+
+  const breakdown: QualificationScoreBreakdown = {
+    need, businessStrength, reachability, evidenceQuality, penalty, total, signals: signals.slice(0, 8),
+  };
+  return { score: total, opportunity, painPoints, breakdown };
+}
+
+export function opportunityFor(candidate: BusinessCandidate, evidence?: QualificationEvidence) {
+  const result = calculateQualificationScore(candidate, evidence);
+  return { opportunity: result.opportunity, painPoints: result.painPoints };
+}
+
+function clamp(value: number, minimum: number, maximum: number) {
+  return Math.min(maximum, Math.max(minimum, value));
 }

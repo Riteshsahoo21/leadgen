@@ -4,12 +4,12 @@ import Fastify from 'fastify';
 import { z } from 'zod';
 import { config } from './config.js';
 import {
-  closeDatabase, createRun, dashboardOverview, databaseHealth, getRun, listRuns, pool,
+  cancelPendingCompanies, closeDatabase, createRun, dashboardOverview, databaseHealth, getRun, listRuns, pool,
   getBusinessDetail, listBusinesses, listMessages, listPipelineEvents, listQualifications,
-  recentEvents, recentLeads, setRunStatus,
+  logEvent, recentEvents, recentLeads, setRunStatus,
 } from './db.js';
 import { createRunSchema } from './domain.js';
-import { closeQueues, enqueue, queueSnapshot } from './queues.js';
+import { cancelRunJobs, closeQueues, enqueue, queueSnapshot } from './queues.js';
 
 const app = Fastify({ logger: { level: config.NODE_ENV === 'production' ? 'info' : 'debug' } });
 
@@ -58,6 +58,7 @@ const listQuerySchema = z.object({
   status: z.string().max(80).optional(),
   direction: z.enum(['inbound', 'outbound']).optional(),
   qualified: z.enum(['true', 'false']).optional(),
+  opportunity: z.string().max(80).optional(),
   limit: z.coerce.number().int().min(1).max(250).optional(),
   offset: z.coerce.number().int().min(0).optional(),
 });
@@ -106,14 +107,15 @@ app.post('/api/analysis/backfill', async (request, reply) => {
   const parsed = backfillSchema.safeParse(request.body ?? {});
   if (!parsed.success) return reply.code(400).send({ error: 'Invalid analysis backfill request', issues: parsed.error.issues });
   const result = await pool.query(
-    `SELECT c.id,c.run_id FROM companies c
-     WHERE c.website IS NOT NULL AND length(c.website)>0
-       AND c.status NOT IN ('crawl_queued','qualify_queued','research_queued','enrich_queued')
+    `SELECT c.id,c.run_id,c.website FROM companies c
+     WHERE c.status NOT IN ('crawl_queued','qualify_queued','research_queued','enrich_queued','campaign_queued')
      ORDER BY c.updated_at DESC LIMIT $1`, [parsed.data.limit],
   );
   for (const company of result.rows) {
-    await pool.query("UPDATE companies SET status='crawl_queued' WHERE id=$1", [company.id]);
-    await enqueue('crawl', 'refresh-analysis', { runId: company.run_id, companyId: company.id });
+    const queue = company.website ? 'crawl' : 'qualify';
+    const status = company.website ? 'crawl_queued' : 'qualify_queued';
+    await pool.query('UPDATE companies SET status=$2 WHERE id=$1', [company.id, status]);
+    await enqueue(queue, 'refresh-analysis', { runId: company.run_id, companyId: company.id });
   }
   return reply.code(202).send({ queued: result.rowCount ?? 0 });
 });
@@ -122,7 +124,7 @@ app.get('/api/qualifications', async (request, reply) => {
   const parsed = listQuerySchema.safeParse(request.query);
   if (!parsed.success) return reply.code(400).send({ error: 'Invalid query', issues: parsed.error.issues });
   const qualified = parsed.data.qualified === undefined ? undefined : parsed.data.qualified === 'true';
-  return { qualifications: await listQualifications({ qualified, limit: parsed.data.limit }) };
+  return { qualifications: await listQualifications({ qualified, opportunity: parsed.data.opportunity, limit: parsed.data.limit }) };
 });
 
 app.get('/api/messages', async (request, reply) => {
@@ -141,9 +143,13 @@ app.get<{ Params: { id: string } }>('/api/runs/:id', async (request, reply) => {
   const run = await getRun(request.params.id);
   if (!run) return reply.code(404).send({ error: 'Run not found' });
   const companies = await pool.query(
-    `SELECT c.*,q.score AS qualification_score,q.opportunity
+    `SELECT c.*,q.score AS qualification_score,q.opportunity,q.score_breakdown,
+       row_number() OVER (ORDER BY q.score DESC NULLS LAST,c.review_count DESC,c.name)::int AS run_rank,
+       count(*) OVER ()::int AS run_total,
+       CEIL(100.0 * row_number() OVER (ORDER BY q.score DESC NULLS LAST,c.review_count DESC,c.name)
+         / GREATEST(count(*) OVER (),1))::int AS top_percent
      FROM companies c LEFT JOIN qualifications q ON q.company_id=c.id
-     WHERE c.run_id=$1 ORDER BY c.updated_at DESC LIMIT 200`, [run.id],
+     WHERE c.run_id=$1 ORDER BY q.score DESC NULLS LAST,c.review_count DESC,c.name LIMIT 200`, [run.id],
   );
   return { run, companies: companies.rows };
 });
@@ -163,7 +169,11 @@ app.post<{ Params: { id: string } }>('/api/runs/:id/cancel', async (request, rep
     return reply.code(409).send({ error: `Run is already ${run.status}` });
   }
   await setRunStatus(run.id, 'cancelled');
-  return { status: 'cancelled' };
+  const [removedJobs, cancelledCompanies] = await Promise.all([
+    cancelRunJobs(run.id), cancelPendingCompanies(run.id),
+  ]);
+  await logEvent(run.id, 'cancelled', `Pipeline stopped; removed ${removedJobs} pending jobs and stopped ${cancelledCompanies} companies`);
+  return { status: 'cancelled', removedJobs, cancelledCompanies };
 });
 
 const inboundSchema = z.object({

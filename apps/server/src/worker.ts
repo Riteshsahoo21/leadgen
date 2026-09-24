@@ -1,14 +1,14 @@
 import { Worker, type Job } from 'bullmq';
 import { config } from './config.js';
 import {
-  closeDatabase, createMessage, eligibleEmail, getCompany, getEvidence, getRun, insertCompany, pool,
+  closeDatabase, createMessage, eligibleEmail, getCompany, getEvidence, getRun, insertCompany, isRunCancelled, pool,
   logEvent, markDiscoveryFinished, maybeCompleteRun, refreshRunStats, saveContact, saveEmail,
   saveEvidence, saveQualification, setRunStatus, updateCompanyFilter, updateCompanyStatus, mergePublicContactEvidence,
 } from './db.js';
 import { calculateFilterScore, type BusinessCandidate, type CreateRunInput } from './domain.js';
 import { closeQueues, connection, enqueue } from './queues.js';
 import {
-  crawlWebsite, discoverBusinesses, enrichEmails, findDecisionMaker, parseOwner, parseStringList,
+  crawlWebsite, discoverBusinesses, enrichEmails, findDecisionMakers, parseOwner, parseStringList,
   qualifyBusiness, researchPublicContacts, sendWithPosta,
 } from './providers.js';
 
@@ -19,12 +19,18 @@ const workers: Worker[] = [];
 const refreshCounters = new Map<string, { count: number; refreshedAt: number }>();
 
 function addWorker(name: string, processor: (job: Job) => Promise<unknown>, concurrency: number, limiter?: { max: number; duration: number }) {
-  const worker = new Worker(name, processor, { connection, concurrency, ...(limiter ? { limiter } : {}) });
+  const guardedProcessor = async (job: Job) => {
+    const data = job.data as Partial<RunJob> | undefined;
+    if (data?.runId && await isRunCancelled(data.runId)) return { cancelled: true };
+    return processor(job);
+  };
+  const worker = new Worker(name, guardedProcessor, { connection, concurrency, ...(limiter ? { limiter } : {}) });
   worker.on('completed', (job) => console.log(`[${name}] completed ${job.id}`));
   worker.on('failed', async (job, error) => {
     console.error(`[${name}] failed ${job?.id}:`, error.message);
     const data = job?.data as Partial<CompanyJob> | undefined;
     if (job && job.attemptsMade >= (job.opts.attempts ?? 1) && data?.companyId && data.runId) {
+      if (await isRunCancelled(data.runId)) return;
       await updateCompanyStatus(data.companyId, 'failed').catch(() => undefined);
       await logEvent(data.runId, name, error.message, data.companyId).catch(() => undefined);
       await maybeCompleteRun(data.runId).catch(() => undefined);
@@ -43,7 +49,8 @@ addWorker('discovery', async (job: Job<RunJob>) => {
     targetCount: Math.min(run.target_count, config.MAX_DISCOVERY_RESULTS),
   };
   try {
-    const businesses = await discoverBusinesses(input);
+    const businesses = await discoverBusinesses(input, () => isRunCancelled(run.id));
+    if (await isRunCancelled(run.id)) return { cancelled: true };
     for (const business of businesses) {
       business.country ||= input.country;
       const company = await insertCompany(run.id, business);
@@ -81,10 +88,12 @@ addWorker('crawl', async (job: Job<CompanyJob>) => {
   if (!company) return;
   try {
     const evidence = await crawlWebsite(fromCompany(company));
+    if (await isRunCancelled(company.run_id)) return { cancelled: true };
     await saveEvidence(company.id, evidence);
     await updateCompanyStatus(company.id, 'qualify_queued');
     await enqueue('qualify', 'qualify-company', job.data, `qualify:${company.id}`);
   } catch (error) {
+    if (await isRunCancelled(company.run_id)) return { cancelled: true };
     await saveEvidence(company.id, { pagesCrawled: 0, crawlError: error instanceof Error ? error.message : String(error) });
     await updateCompanyStatus(company.id, 'qualify_queued');
     await enqueue('qualify', 'qualify-company', job.data, `qualify:${company.id}`);
@@ -96,11 +105,11 @@ addWorker('qualify', async (job: Job<CompanyJob>) => {
   if (!company) return;
   const evidence = await getEvidence(company.id);
   const qualification = await qualifyBusiness(fromCompany(company), evidence);
+  if (await isRunCancelled(company.run_id)) return { cancelled: true };
   await saveQualification(company.id, qualification);
   if (!qualification.qualified) {
-    await updateCompanyStatus(company.id, 'research_queued');
-    await enqueue('research', 'research-public-contacts', job.data, `research:${company.id}`);
-    await maybeRefresh(company.run_id);
+    await updateCompanyStatus(company.id, 'unqualified');
+    await finishOne(company.run_id);
     return;
   }
   await updateCompanyStatus(company.id, 'research_queued');
@@ -122,21 +131,24 @@ addWorker('research', async (job: Job<CompanyJob>) => {
     }
   }
   const publicResearch = await researchPublicContacts(candidate, evidence);
+  if (await isRunCancelled(company.run_id)) return { cancelled: true };
   await mergePublicContactEvidence(company.id, publicResearch);
-  let contact = await findDecisionMaker(candidate, 'Owner', publicResearch.searchResults);
-  if (!contact && publicResearch.emails.length) {
+  const contacts = await findDecisionMakers(candidate, 'Owner', publicResearch.searchResults);
+  if (!contacts.length && publicResearch.emails.length) {
     const emailSource = publicResearch.sources.find((source) => source.kind === 'email');
-    contact = {
-      fullName: company.name, role: 'Business contact', sourceUrl: emailSource?.sourceUrl,
+    contacts.push({
+      fullName: company.name, role: 'Business contact',
       confidence: emailSource?.sourceType === 'company_website' || emailSource?.sourceType === 'google_maps' ? 82 : 68,
-    };
+      ...(emailSource?.sourceUrl ? { sourceUrl: emailSource.sourceUrl } : {}),
+    });
   }
-  if (!contact) {
+  if (!contacts.length) {
     await updateCompanyStatus(company.id, 'no_contact');
     await finishOne(company.run_id);
     return;
   }
-  const saved = await saveContact(company.id, contact);
+  const savedContacts = await Promise.all(contacts.map((contact) => saveContact(company.id, contact)));
+  const saved = savedContacts[0]!;
   if (config.PIPELINE_STOP_AFTER === 'research') {
     await updateCompanyStatus(company.id, 'contact_found');
     await finishOne(company.run_id);
@@ -156,6 +168,7 @@ addWorker('enrich', async (job: Job<CompanyJob & { contactId: string }>) => {
   if (!contact) return;
   const sources = Array.isArray(evidence?.contact_sources) ? evidence.contact_sources : [];
   const results = await enrichEmails(fromCompany(company), contact.full_name, sources, evidence?.emails ?? []);
+  if (await isRunCancelled(company.run_id)) return { cancelled: true };
   if (!results.length) {
     await updateCompanyStatus(company.id, 'no_email');
     await finishOne(company.run_id);
@@ -186,6 +199,7 @@ addWorker('campaign', async (job: Job<CompanyJob & { emailId: string }>) => {
   const subject = `A quick idea for ${lead.company_name}`;
   const painPoint = Array.isArray(lead.pain_points) ? lead.pain_points[0] : undefined;
   const body = `Hi ${firstName},\n\nI came across ${lead.company_name} and noticed ${painPoint ?? 'an opportunity to improve the customer journey'}. Would a short, no-pressure review be useful?\n\nIf this is not relevant, reply unsubscribe and I will not contact you again.`;
+  if (await isRunCancelled(lead.run_id)) return { cancelled: true };
   if (config.PROVIDER_MODE === 'live' && config.ENABLE_EMAIL_SENDING) {
     const sent = await sendWithPosta(lead.email, subject, body);
     await createMessage({ runId: lead.run_id, companyId: lead.company_id, emailId: lead.id, status: 'sent', providerId: sent.id, subject, body });

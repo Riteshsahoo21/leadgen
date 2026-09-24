@@ -2,7 +2,7 @@ import dns from 'node:dns/promises';
 import { load } from 'cheerio';
 import { parse } from 'csv-parse/sync';
 import { config } from './config.js';
-import { normalizeDomain, opportunityFor, type BusinessCandidate, type CreateRunInput } from './domain.js';
+import { calculateQualificationScore, normalizeDomain, type BusinessCandidate, type CreateRunInput } from './domain.js';
 
 const serviceWords = ['Studio', 'Works', 'Collective', 'Partners', 'Solutions', 'House', 'Company'];
 
@@ -31,8 +31,12 @@ export function safeBusinesses(input: CreateRunInput): BusinessCandidate[] {
   });
 }
 
-export async function discoverBusinesses(input: CreateRunInput): Promise<BusinessCandidate[]> {
+export async function discoverBusinesses(
+  input: CreateRunInput,
+  shouldStop?: () => Promise<boolean>,
+): Promise<BusinessCandidate[]> {
   if (config.PROVIDER_MODE === 'safe') return safeBusinesses(input);
+  if (await shouldStop?.()) return [];
 
   const keywords = input.cities.flatMap((city) => input.businessTypes.map((type) => `${type} in ${city}, ${input.country}`));
   const depth = mapsDepthFor(input.targetCount, keywords.length);
@@ -57,7 +61,9 @@ export async function discoverBusinesses(input: CreateRunInput): Promise<Busines
   const jobId = String(payload.id ?? payload.ID ?? payload.job_id ?? payload.job?.id ?? '');
   if (!jobId) throw new Error('Maps service returned neither results nor a job ID');
   for (let attempt = 0; attempt < 180; attempt += 1) {
+    if (await shouldStop?.()) return [];
     await delay(10_000);
+    if (await shouldStop?.()) return [];
     const statusResponse = await fetch(`${config.GMAPS_API_URL}/api/v1/jobs/${encodeURIComponent(jobId)}`, { signal: AbortSignal.timeout(15_000) });
     if (!statusResponse.ok) throw new Error(`Maps job status failed (${statusResponse.status})`);
     const statusPayload = await statusResponse.json() as Record<string, any>;
@@ -385,30 +391,39 @@ function extractStructuredData(
 
 export async function qualifyBusiness(candidate: BusinessCandidate, evidence?: Record<string, unknown>) {
   const pagesCrawled = Number(evidence?.pages_crawled ?? 0);
-  const fallback = opportunityFor(candidate, {
-    hasBooking: Boolean(evidence?.has_booking), hasContactForm: Boolean(evidence?.has_contact_form),
-    hasPayment: Boolean(evidence?.has_payment), pagesCrawled,
+  const storedEvidence = evidence?.evidence && typeof evidence.evidence === 'object' ? evidence.evidence as Record<string, unknown> : {};
+  const capabilities = storedEvidence.capabilities && typeof storedEvidence.capabilities === 'object' ? storedEvidence.capabilities : undefined;
+  const scoring = calculateQualificationScore(candidate, {
+    hasBooking: evidence?.has_booking === true,
+    hasContactForm: evidence?.has_contact_form === true,
+    hasPayment: evidence?.has_payment === true,
+    pagesCrawled,
+    publicEmails: Array.isArray(evidence?.emails) ? evidence.emails.length : 0,
+    publicPhones: Array.isArray(evidence?.phones) ? evidence.phones.length : 0,
+    socialProfiles: Array.isArray(evidence?.social_links) ? evidence.social_links.length : 0,
+    crawlFailed: Boolean(storedEvidence.crawlError),
   });
-  const baseline = Math.min(98, 42 + (candidate.phone ? 10 : 0) + ((candidate.reviewCount ?? 0) > 30 ? 14 : 0)
-    + (!candidate.website ? 24 : 8) + (pagesCrawled > 0 && evidence?.has_booking === false ? 6 : 0));
+  const qualifiedOpportunity = ['new_website', 'website_improvement'].includes(scoring.opportunity);
   const ruleResult = {
-    qualified: baseline >= config.MIN_QUALIFICATION_SCORE, score: baseline, ...fallback,
-    recommendedRole: 'Owner', rationale: buildQualificationRationale(candidate, evidence, fallback.painPoints), model: 'rules-live-fallback',
+    qualified: qualifiedOpportunity && scoring.score >= config.MIN_QUALIFICATION_SCORE,
+    score: scoring.score,
+    opportunity: scoring.opportunity,
+    painPoints: normalizePainPoints(scoring.painPoints, pagesCrawled),
+    scoreBreakdown: scoring.breakdown,
+    recommendedRole: 'Owner',
+    rationale: buildQualificationRationale(candidate, evidence, scoring.painPoints),
+    model: 'bayesian-weighted-rules',
   };
   if (config.PROVIDER_MODE === 'safe') return {
     ...ruleResult, rationale: 'Deterministic safe-mode qualification using stored evidence.', model: 'rules-safe-mode',
   };
 
   const schema = {
-    type: 'object', required: ['qualified','score','opportunity','pain_points','recommended_role','rationale'],
+    type: 'object', required: ['recommended_role','rationale'],
     properties: {
-      qualified: { type: 'boolean' }, score: { type: 'integer', minimum: 0, maximum: 100 },
-      opportunity: { type: 'string' }, pain_points: { type: 'array', items: { type: 'string' }, maxItems: 5 },
       recommended_role: { type: 'string' }, rationale: { type: 'string' },
     },
   };
-  const storedEvidence = evidence?.evidence && typeof evidence.evidence === 'object' ? evidence.evidence as Record<string, unknown> : {};
-  const capabilities = storedEvidence.capabilities && typeof storedEvidence.capabilities === 'object' ? storedEvidence.capabilities : undefined;
   const compactEvidence = evidence ? {
     title: evidence.title,
     description: evidence.description,
@@ -433,23 +448,20 @@ export async function qualifyBusiness(candidate: BusinessCandidate, evidence?: R
     const response = await fetch(`${config.OLLAMA_URL}/api/chat`, {
       method: 'POST', headers: { 'content-type': 'application/json' }, signal: AbortSignal.timeout(300_000),
       body: JSON.stringify({ model: config.OLLAMA_MODEL, stream: false, think: false, format: schema, keep_alive: 0,
-        options: { temperature: 0.1, num_ctx: 2048, num_predict: 256 }, messages: [
-          { role: 'system', content: 'Qualify only from supplied evidence. Never invent facts. A capability with status detected may be stated as present. A not_detected capability means only that it was not seen on the checked pages; never claim the business definitely lacks it. Unknown means no conclusion is allowed. Do not infer purchasing, ecommerce, booking, contact forms, products, or services from a generic website description. The rationale must explain the opportunity in 1-3 concise sentences and use cautious evidence language. Return strict JSON.' },
-          { role: 'user', content: JSON.stringify({ company: compactCompany, websiteEvidence: compactEvidence }) },
+        options: { temperature: 0.1, num_ctx: 2048, num_predict: 192 }, messages: [
+          { role: 'system', content: 'Explain the supplied algorithmic lead assessment; do not assign or alter its score, qualification, opportunity type, or pain points. Never invent facts. A detected capability may be stated as present. Not_detected means only that it was not seen on checked pages; never claim definite absence. Unknown means no conclusion is allowed. The rationale must explain why this is or is not an outreach priority in 1-3 concise sentences. Return strict JSON.' },
+          { role: 'user', content: JSON.stringify({ company: compactCompany, websiteEvidence: compactEvidence, algorithmicAssessment: ruleResult }) },
         ] }),
     });
     if (!response.ok) throw new Error(`Ollama error ${response.status}`);
     const data = await response.json() as { message?: { content?: string } };
     const parsed = JSON.parse(data.message?.content ?? '{}') as Record<string, unknown>;
-    const score = hybridQualificationScore(baseline, parsed.score);
-    const painPoints = normalizePainPoints(Array.isArray(parsed.pain_points) ? parsed.pain_points.map(String).slice(0, 5) : fallback.painPoints, pagesCrawled);
+    const painPoints = ruleResult.painPoints;
     const aiRationale = String(parsed.rationale ?? '').trim();
     const rationale = aiRationale && rationaleMatchesEvidence(aiRationale, capabilities)
       ? aiRationale : buildQualificationRationale(candidate, evidence, painPoints);
     return {
-      qualified: ruleResult.qualified || (Boolean(parsed.qualified) && score >= config.MIN_QUALIFICATION_SCORE), score,
-      opportunity: fallback.opportunity,
-      painPoints,
+      ...ruleResult,
       recommendedRole: String(parsed.recommended_role ?? 'Owner'), rationale, model: config.OLLAMA_MODEL,
     };
   } catch (error) {
@@ -495,7 +507,7 @@ export async function researchPublicContacts(candidate: BusinessCandidate, evide
   }
   if (config.PROVIDER_MODE === 'safe') return { emails: [...emails], phones: [...phones], socialLinks: [...socialLinks], sources: [...sources.values()], searchResults: [] };
 
-  const socialPages = await Promise.allSettled([...socialLinks].slice(0, 4).map((url) => crawlPublicContactPage(url)));
+  const socialPages = await Promise.allSettled([...socialLinks].slice(0, 6).map((url) => crawlPublicContactPage(url)));
   for (const result of socialPages) {
     if (result.status !== 'fulfilled') continue;
     for (const email of result.value.emails) {
@@ -509,6 +521,8 @@ export async function researchPublicContacts(candidate: BusinessCandidate, evide
   const domain = normalizeDomain(candidate.website);
   const location = [candidate.city, candidate.country].filter(Boolean).join(' ');
   const queries = [
+    `${candidate.name} proprietor managing director partner president ${location}`,
+    `site:linkedin.com/in ${candidate.name} owner founder CEO director`,
     `"${candidate.name}" email contact ${location}`,
     `"${candidate.name}" gmail phone ${location}`,
     `"${candidate.name}" owner founder director ${location}`,
@@ -567,6 +581,64 @@ export async function findDecisionMaker(candidate: BusinessCandidate, role = 'Ow
   const clean = (result.title ?? '').replace(/\s*[|–—-].*$/, '').replace(/\b(owner|founder|director|ceo)\b/ig, '').trim();
   if (clean.split(/\s+/).length < 2) return undefined;
   return { fullName: clean.slice(0, 100), role, sourceUrl: result.url, confidence: 55 };
+}
+
+export async function findDecisionMakers(candidate: BusinessCandidate, role = 'Owner', suppliedResults: PublicSearchResult[] = []) {
+  if (config.PROVIDER_MODE === 'safe') {
+    const names = ['Aarav Sharma', 'Isha Patel', 'Rohan Das', 'Meera Singh', 'Arjun Rao'];
+    return [{
+      fullName: names[candidate.name.length % names.length]!, role, confidence: 76,
+      ...(candidate.website ? { sourceUrl: candidate.website } : {}),
+    }];
+  }
+  const contacts: Array<{ fullName: string; role: string; sourceUrl?: string; confidence: number }> = [];
+  if (candidate.owner?.name) contacts.push({
+    fullName: candidate.owner.name, role, confidence: 88,
+    ...(candidate.owner.sourceUrl ? { sourceUrl: candidate.owner.sourceUrl } : {}),
+  });
+  const results = suppliedResults.length ? suppliedResults : await searchPublicWeb(
+    `${candidate.name} owner founder CEO director proprietor partner ${candidate.city ?? ''}`,
+  );
+  const companyTokens = candidate.name.toLowerCase().split(/[^a-z0-9]+/).filter((value) => value.length >= 4);
+  const domain = normalizeDomain(candidate.website);
+  const rolePattern = /\b(co[ -]?founder|founder|owner|chief executive officer|ceo|managing director|director|proprietor|partner|president)\b/i;
+  for (const result of results) {
+    const combined = `${result.title ?? ''} ${result.content ?? ''}`;
+    const roleMatch = combined.match(rolePattern);
+    if (!roleMatch) continue;
+    const relevant = companyTokens.some((token) => combined.toLowerCase().includes(token))
+      || Boolean(domain && result.url?.toLowerCase().includes(domain));
+    if (!relevant) continue;
+    const titleParts = (result.title ?? '').split(/\s+(?:\||-|–|—|:)\s+/);
+    const contentName = combined.match(/\b([A-Z][A-Za-z.'-]+(?:\s+[A-Z][A-Za-z.'-]+){1,3})\s+(?:is\s+(?:the\s+)?|,\s*)?(?:co[ -]?founder|founder|owner|chief executive officer|ceo|managing director|director|proprietor|partner|president)\b/i)?.[1];
+    const rawName = contentName ?? titleParts.find((part) => isLikelyPersonName(part, candidate.name, rolePattern));
+    if (!rawName) continue;
+    const fullName = rawName.replace(rolePattern, '').replace(/\s+/g, ' ').trim().slice(0, 100);
+    if (!isLikelyPersonName(fullName, candidate.name, rolePattern)) continue;
+    contacts.push({
+      fullName,
+      role: titleCase(roleMatch[1]!.replace(/chief executive officer/i, 'CEO')),
+      confidence: result.url && domain && result.url.toLowerCase().includes(domain) ? 82
+        : result.url && /linkedin\.com\/in\//i.test(result.url) ? 76 : 64,
+      ...(result.url ? { sourceUrl: result.url } : {}),
+    });
+  }
+  const unique = new Map<string, (typeof contacts)[number]>();
+  for (const contact of contacts) {
+    const key = contact.fullName.toLowerCase();
+    const previous = unique.get(key);
+    if (!previous || contact.confidence > previous.confidence) unique.set(key, contact);
+  }
+  return [...unique.values()].sort((left, right) => right.confidence - left.confidence).slice(0, 5);
+}
+
+function isLikelyPersonName(value: string, companyName: string, rolePattern: RegExp) {
+  const clean = value.replace(rolePattern, '').replace(/\s+/g, ' ').trim();
+  const words = clean.split(' ').filter(Boolean);
+  if (words.length < 2 || words.length > 5 || clean.length > 100) return false;
+  if (!/^[A-Za-z][A-Za-z.'-]*(?:\s+[A-Za-z][A-Za-z.'-]*)+$/.test(clean)) return false;
+  if (clean.toLowerCase() === companyName.toLowerCase()) return false;
+  return !/\b(company|business|official|profile|linkedin|facebook|instagram|services|solutions|private|limited|ltd)\b/i.test(clean);
 }
 
 export async function enrichEmails(candidate: BusinessCandidate, fullName: string, publicSources: ContactEvidenceSource[] = [], harvested: string[] = []) {
@@ -784,12 +856,6 @@ function normalizePainPoints(values: string[], pagesCrawled: number) {
     if (/^(?:no|missing|lacks?)\b.*(?:payment|purchase|checkout|e-?commerce)/i.test(value)) return `No online purchase or payment flow detected ${checkedPages}`;
     return value;
   }))];
-}
-
-export function hybridQualificationScore(baseline: number, aiValue: unknown) {
-  const aiScore = Number(aiValue);
-  const boundedAiScore = Number.isFinite(aiScore) ? Math.max(0, Math.min(100, aiScore)) : 0;
-  return Math.max(Math.max(0, Math.min(100, baseline)), boundedAiScore);
 }
 
 function rationaleMatchesEvidence(value: string, capabilities: unknown) {

@@ -36,6 +36,25 @@ export async function getRun(id: string) {
   return result.rows[0];
 }
 
+export async function isRunCancelled(id: string) {
+  const result = await pool.query<{ cancelled: boolean }>(
+    `SELECT status='cancelled' AS cancelled FROM discovery_runs WHERE id=$1`, [id],
+  );
+  return result.rows[0]?.cancelled ?? true;
+}
+
+export async function cancelPendingCompanies(runId: string) {
+  const result = await pool.query(
+    `UPDATE companies SET status='cancelled'
+     WHERE run_id=$1 AND status NOT IN (
+       'filtered_out','unqualified','no_contact','no_email','email_risky','invalid_email',
+       'contact_found','email_verified','drafted','contacted','failed','cancelled'
+     )`,
+    [runId],
+  );
+  return result.rowCount ?? 0;
+}
+
 export async function setRunStatus(id: string, status: string, error?: string) {
   await pool.query(
     `UPDATE discovery_runs SET status = $2, error = $3,
@@ -52,7 +71,7 @@ export async function markDiscoveryFinished(id: string) {
 
 const terminalCompanyStatuses = [
   'filtered_out', 'unqualified', 'no_contact', 'no_email', 'email_risky',
-  'invalid_email', 'contact_found', 'email_verified', 'drafted', 'contacted', 'failed',
+  'invalid_email', 'contact_found', 'email_verified', 'drafted', 'contacted', 'failed', 'cancelled',
 ];
 
 export async function maybeCompleteRun(runId: string) {
@@ -183,17 +202,18 @@ export async function mergePublicContactEvidence(companyId: string, value: Publi
 
 export async function saveQualification(companyId: string, value: {
   qualified: boolean; score: number; opportunity: string; painPoints: string[];
-  recommendedRole: string; rationale?: string; model?: string;
+  recommendedRole: string; rationale?: string; model?: string; scoreBreakdown?: Record<string, unknown>;
 }) {
   await pool.query(
     `INSERT INTO qualifications
-       (company_id,qualified,score,opportunity,pain_points,recommended_role,rationale,model)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+       (company_id,qualified,score,opportunity,pain_points,recommended_role,rationale,model,score_breakdown)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
      ON CONFLICT (company_id) DO UPDATE SET qualified=EXCLUDED.qualified,score=EXCLUDED.score,
        opportunity=EXCLUDED.opportunity,pain_points=EXCLUDED.pain_points,
-       recommended_role=EXCLUDED.recommended_role,rationale=EXCLUDED.rationale,model=EXCLUDED.model`,
+       recommended_role=EXCLUDED.recommended_role,rationale=EXCLUDED.rationale,model=EXCLUDED.model,
+       score_breakdown=EXCLUDED.score_breakdown`,
     [companyId, value.qualified, value.score, value.opportunity, value.painPoints,
-      value.recommendedRole, value.rationale ?? null, value.model ?? null],
+      value.recommendedRole, value.rationale ?? null, value.model ?? null, value.scoreBreakdown ?? {}],
   );
 }
 
@@ -329,14 +349,37 @@ export async function getBusinessDetail(id: string) {
   return result.rows[0];
 }
 
-export async function listQualifications(input: { qualified?: boolean | undefined; limit?: number | undefined } = {}) {
+export async function listQualifications(input: { qualified?: boolean | undefined; opportunity?: string | undefined; limit?: number | undefined } = {}) {
   const limit = Math.min(Math.max(input.limit ?? 100, 1), 250);
   const result = await pool.query(
-    `SELECT q.*,c.name AS company_name,c.category,c.city,c.country,c.website,c.status
-     FROM qualifications q JOIN companies c ON c.id=q.company_id
-     WHERE ($1::boolean IS NULL OR q.qualified=$1)
-     ORDER BY q.score DESC,q.created_at DESC LIMIT $2`,
-    [input.qualified ?? null, limit],
+    `WITH ranked AS (
+       SELECT q.*,c.run_id,c.name AS company_name,c.category,c.city,c.country,c.website,c.status,c.review_count,
+         (c.website IS NOT NULL AND length(c.website)>0) AS has_website,
+         row_number() OVER (
+           PARTITION BY c.run_id
+           ORDER BY q.score DESC,
+             (SELECT count(*) FROM contact_emails e WHERE e.company_id=c.id AND e.verification_status='valid') DESC,
+             c.review_count DESC,c.name
+         )::int AS run_rank,
+         count(*) OVER (PARTITION BY c.run_id)::int AS run_total,
+         (SELECT count(*)::int FROM contacts x WHERE x.company_id=c.id) AS contact_count,
+         (SELECT count(*)::int FROM contact_emails e WHERE e.company_id=c.id) AS email_count
+       FROM qualifications q JOIN companies c ON c.id=q.company_id
+     )
+     SELECT ranked.*,
+       CEIL(100.0 * run_rank / GREATEST(run_total,1))::int AS top_percent,
+       CASE
+         WHEN score >= 80 AND qualified THEN 'contact_now'
+         WHEN score >= 70 AND qualified THEN 'high_priority'
+         WHEN qualified THEN 'qualified'
+         WHEN opportunity='manual_review' THEN 'manual_review'
+         ELSE 'skip'
+       END AS priority_label
+     FROM ranked
+     WHERE ($1::boolean IS NULL OR qualified=$1)
+       AND ($2='' OR opportunity=$2)
+     ORDER BY score DESC,run_rank,created_at DESC LIMIT $3`,
+    [input.qualified ?? null, input.opportunity ?? '', limit],
   );
   return result.rows;
 }

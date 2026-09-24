@@ -41,6 +41,10 @@ export type Lead = {
   qualified?: boolean;
   qualification_score?: number;
   opportunity?: string;
+  score_breakdown?: ScoreBreakdown;
+  run_rank?: number;
+  run_total?: number;
+  top_percent?: number;
   pain_points?: string[];
   recommended_role?: string;
   full_name?: string;
@@ -71,7 +75,26 @@ export type Qualification = {
   recommended_role: string;
   rationale?: string;
   model?: string;
+  has_website: boolean;
+  score_breakdown?: ScoreBreakdown;
+  run_rank: number;
+  run_total: number;
+  top_percent: number;
+  priority_label: string;
+  contact_count: number;
+  email_count: number;
+  review_count: number;
   created_at: string;
+};
+
+export type ScoreBreakdown = {
+  need?: number;
+  businessStrength?: number;
+  reachability?: number;
+  evidenceQuality?: number;
+  penalty?: number;
+  total?: number;
+  signals?: string[];
 };
 
 export type Message = {

@@ -38,6 +38,19 @@ export async function queueSnapshot() {
   return Object.fromEntries(entries);
 }
 
+export async function cancelRunJobs(runId: string) {
+  let removed = 0;
+  for (const queue of Object.values(queues)) {
+    const jobs = await queue.getJobs(['waiting', 'delayed', 'prioritized', 'paused'], 0, -1, true);
+    for (const job of jobs) {
+      if (job.data?.runId !== runId) continue;
+      await job.remove();
+      removed += 1;
+    }
+  }
+  return removed;
+}
+
 export async function closeQueues() {
   await Promise.all(Object.values(queues).map((queue) => queue.close()));
 }
