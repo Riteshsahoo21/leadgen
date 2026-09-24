@@ -33,7 +33,7 @@ const start = Date.now();
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 async function request(path: string, method = 'GET', body?: unknown) {
   const response = await fetch(`http://127.0.0.1:3099${path}`, {
-    method, headers: { authorization: `Bearer ${process.env.API_TOKEN}`, 'content-type': 'application/json' },
+    method, headers: { authorization: `Bearer ${process.env.API_TOKEN}`, ...(body ? { 'content-type': 'application/json' } : {}) },
     ...(body ? { body: JSON.stringify(body) } : {}),
   });
   return { status: response.status, data: await response.json() as any };

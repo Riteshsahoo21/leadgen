@@ -175,7 +175,7 @@ export const clearToken = () => localStorage.removeItem(tokenKey);
 export async function api<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(path, {
     ...init,
-    headers: { 'content-type': 'application/json', authorization: `Bearer ${getToken()}`, ...init?.headers },
+    headers: { ...(init?.body ? { 'content-type': 'application/json' } : {}), authorization: `Bearer ${getToken()}`, ...init?.headers },
   });
   const body = await response.json().catch(() => ({})) as { message?: string; error?: string };
   if (!response.ok) throw new Error(body.message ?? body.error ?? `Request failed (${response.status})`);
