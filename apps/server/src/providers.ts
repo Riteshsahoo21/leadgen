@@ -93,10 +93,10 @@ export function mapsDepthFor(targetCount: number, keywordCount: number) {
 export function buildDiscoveryKeywords(input: CreateRunInput) {
   // Each Maps query has finite inventory. Expand large targets across geographic
   // sections and search intents, while keeping one bounded upstream job.
-  const desired = Math.min(60, Math.max(
+  const desired = Math.max(
     input.cities.length * input.businessTypes.length,
-    Math.ceil(input.targetCount / 100),
-  ));
+    Math.min(240, Math.ceil(input.targetCount / 40)),
+  );
   const variants = [
     (type: string, city: string) => `${type} in ${city}, ${input.country}`,
     (type: string, city: string) => `${type} near ${city}, ${input.country}`,
