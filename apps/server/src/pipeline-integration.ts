@@ -30,6 +30,8 @@ let apiProcess: ChildProcess | undefined;
 const db = await import('./db.js');
 const queues = await import('./queues.js');
 const start = Date.now();
+const target = Number(process.env.TEST_TARGET_COUNT ?? 3000);
+assert.ok([3000, 5000].includes(target), 'Test target must be 3000 or 5000');
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 async function request(path: string, method = 'GET', body?: unknown) {
   const response = await fetch(`http://127.0.0.1:3099${path}`, {
@@ -57,7 +59,7 @@ try {
   apiProcess = child('api');
   await until(async () => { try { return (await request('/health')).status === 200; } catch { return false; } });
   const created = await request('/api/runs', 'POST', {
-    name: 'ISOLATED 3000 pipeline test', country: 'India', cities: ['Test City'], businessTypes: ['dentist'], targetCount: 3000,
+    name: `ISOLATED ${target} pipeline test`, country: 'India', cities: ['Test City'], businessTypes: ['dentist'], targetCount: target,
   });
   assert.equal(created.status, 202);
   const id = created.data.run.id;
@@ -78,23 +80,31 @@ try {
   assert.equal((await request(`/api/runs/${id}/resume`, 'POST')).status, 200);
   await until(async () => (await db.getRun(id)).status === 'completed', 300_000);
   const run = await db.getRun(id);
-  assert.equal(run.stats.discovered, 3000);
+  assert.equal(run.stats.discovered, target);
   assert.equal(run.stats.pending, 0);
   assert.equal(run.stats.ai_pending, 0);
   assert.equal(run.discovery_state.reason, 'target_reached');
   assert.ok(run.stats.evaluated > 250);
-  assert.equal(run.stats.finished, 3000);
+  assert.equal(run.stats.finished, target);
   const page1 = await request('/api/qualifications?limit=100&offset=0');
   const page2 = await request('/api/qualifications?limit=100&offset=100');
   assert.equal(page1.status, 200);
   assert.equal(page2.data.qualifications.length, 100);
   assert.equal(new Set([...page1.data.qualifications, ...page2.data.qualifications].map(row => row.id)).size, 200);
-  assert.equal((await request(`/api/runs/${id}?limit=100&offset=2900`)).data.companies.length, 100);
-  assert.equal((await request('/api/overview')).data.overview.businesses, 3000);
-  console.log(JSON.stringify({ test: '3000 businesses, active pause/resume, dedupe, pagination, synchronized completion', stats: run.stats, seconds: Math.round((Date.now() - start) / 1000) }));
+  assert.equal((await request(`/api/runs/${id}?limit=100&offset=${target - 100}`)).data.companies.length, 100);
+  assert.equal((await request('/api/overview')).data.overview.businesses, target);
+  const businessPage = await request(`/api/businesses?limit=100&offset=${target - 100}`);
+  assert.equal(businessPage.status, 200);
+  assert.equal(businessPage.data.total, target);
+  assert.equal(businessPage.data.items.length, 100);
+  const qualifiedBusinesses = await request('/api/businesses?status=qualified&limit=100');
+  assert.equal(qualifiedBusinesses.status, 200);
+  assert.equal(qualifiedBusinesses.data.total, run.stats.qualified);
+  assert.ok(qualifiedBusinesses.data.items.every((row: { qualified: boolean }) => row.qualified));
+  console.log(JSON.stringify({ test: `${target} businesses, active pause/resume, dedupe, pagination, synchronized completion`, stats: run.stats, seconds: Math.round((Date.now() - start) / 1000) }));
 
   const stopped = await request('/api/runs', 'POST', {
-    name: 'ISOLATED stop test', country: 'India', cities: ['Stop City'], businessTypes: ['clinic'], targetCount: 3000,
+    name: 'ISOLATED stop test', country: 'India', cities: ['Stop City'], businessTypes: ['clinic'], targetCount: target,
   });
   const stopId = stopped.data.run.id;
   assert.equal((await request(`/api/runs/${stopId}/cancel`, 'POST')).status, 200);

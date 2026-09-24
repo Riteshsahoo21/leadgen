@@ -21,7 +21,7 @@ const emptySummary: QualificationSummary = {
 export function QualificationPage() {
   const [items, setItems] = useState<Qualification[]>([]);
   const [summary, setSummary] = useState<QualificationSummary>(emptySummary);
-  const [filter, setFilter] = useState<(typeof filters)[number][0]>('all');
+  const [filter, setFilter] = useState<(typeof filters)[number][0]>('actionable');
   const [page, setPage] = useState(0);
   const [total, setTotal] = useState(0);
   const [loading, setLoading] = useState(true);
@@ -36,13 +36,13 @@ export function QualificationPage() {
     finally { setLoading(false); }
   }, 5_000, `${filter}:${page}`);
   return <>
-    <PageHeader eyebrow="LEAD PRIORITIZATION" title="Qualification" description="Evaluated is total classification progress. Qualified is the selected outreach subset. AI explanations run separately so they never block crawling, contact research, or enrichment." />
+    <PageHeader eyebrow="LEAD PRIORITIZATION" title="Qualification" description="Qualified leads need a new website or improvements supported by collected evidence. Higher outreach-priority scores mean stronger opportunities—not better websites. AI adds explanations without blocking the pipeline." />
     <section className="stats-grid stats-grid-three">
       <StatCard label="Evaluated" value={summary.evaluated} note={`${summary.qualified} qualified · ${summary.not_qualified} not selected`} icon={BrainCircuit} />
       <StatCard label="Qualified leads" value={summary.qualified} note={`${summary.new_website} no website · ${summary.website_improvement} incomplete`} icon={CheckCircle2} tone="green" />
       <StatCard label="AI explanations" value={summary.ai_explained} note={`${summary.ai_pending} pending · ${summary.ai_fallback} rules fallback`} icon={Gauge} tone="violet" />
     </section>
-    <Panel title="Ranked qualification results" subtitle="Weighted need, Bayesian-adjusted reputation, reachability, and evidence quality" action={<div className="segmented">{filters.map(([value, label]) => <button key={value} className={filter === value ? 'active' : ''} onClick={() => { setPage(0); setFilter(value); }}>{label}</button>)}</div>}>
+    <Panel title="Ranked qualification results" subtitle="Higher score = stronger outreach opportunity. Filter by no website or improvement needs." action={<div className="segmented">{filters.map(([value, label]) => <button key={value} className={filter === value ? 'active' : ''} onClick={() => { setPage(0); setFilter(value); }}>{label}</button>)}</div>}>
       {error && <div className="alert">{error}</div>}
       <div className="qualification-list">{items.map((item) => {
         const breakdown = item.score_breakdown ?? {};

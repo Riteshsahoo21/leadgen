@@ -151,7 +151,7 @@ export type EventItem = {
 };
 
 export type OverviewResponse = {
-  overview: { businesses: number; qualified: number; verified: number; contacted: number; active_runs: number };
+  overview: { businesses: number; evaluated?: number; websites_crawled?: number; qualified: number; verified: number; contacted: number; active_runs: number };
   queues: Record<string, QueueCounts>;
   runs: Run[];
   leads: Lead[];

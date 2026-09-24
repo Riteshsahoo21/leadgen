@@ -300,6 +300,8 @@ export async function dashboardOverview() {
   const result = await pool.query(`
     SELECT
       (SELECT count(*)::int FROM companies) AS businesses,
+      (SELECT count(*)::int FROM qualifications) AS evaluated,
+      (SELECT count(*)::int FROM website_evidence WHERE pages_crawled>0) AS websites_crawled,
       (SELECT count(*)::int FROM qualifications WHERE qualified) AS qualified,
       (SELECT count(*)::int FROM contact_emails WHERE verification_status='valid') AS verified,
       (SELECT count(*)::int FROM messages WHERE direction='outbound' AND status IN ('sent','delivered')) AS contacted,
@@ -341,7 +343,9 @@ export async function listBusinesses(input: { search?: string | undefined; statu
   const offset = Math.max(input.offset ?? 0, 0);
   const where = `WHERE ($1 = '' OR c.name ILIKE '%' || $1 || '%' OR c.city ILIKE '%' || $1 || '%'
       OR c.country ILIKE '%' || $1 || '%' OR c.category ILIKE '%' || $1 || '%' OR c.domain ILIKE '%' || $1 || '%')
-    AND ($2 = '' OR c.status = $2)`;
+    AND ($2 = '' OR c.status = $2 OR ($2='qualified' AND EXISTS (
+      SELECT 1 FROM qualifications q WHERE q.company_id=c.id AND q.qualified
+    )))`;
   const [items, count] = await Promise.all([
     pool.query(
       `SELECT c.id,c.run_id,c.name,c.category,c.city,c.country,c.address,c.website,c.domain,c.phone,
