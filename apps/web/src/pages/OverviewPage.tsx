@@ -30,7 +30,7 @@ export function OverviewPage() {
 
 function Pipeline({ run }: { run?: Run }) {
   const values = run?.stats ?? { discovered: 0, filtered: 0, qualified: 0, contacts: 0, verified: 0, contacted: 0 };
-  const steps = [['Discovered', values.discovered], ['Filtered', values.filtered], ['Qualified', values.qualified], ['Contacts', values.contacts], ['Verified', values.verified], ['Contacted', values.contacted]] as const;
+  const steps = [['Discovered', values.discovered], ['Filtered', values.filtered], ['Evaluated', run?.stats.evaluated ?? 0], ['Qualified', values.qualified], ['Contacts', values.contacts], ['Verified', values.verified], ['AI explained', run?.stats.ai_explained ?? 0]] as const;
   const max = Math.max(values.discovered, 1);
   return <div className="pipeline"><div className="pipeline-target"><span>Target volume</span><strong>{formatNumber(run?.target_count ?? 0)}</strong><small>{run ? `${run.business_types.join(', ')} across ${run.cities.join(', ')}` : 'No active market scope'}</small></div><div className="funnel">{steps.map(([label, value], index) => <div className="funnel-row" key={label}><div><span>{label}</span><strong>{formatNumber(value)}</strong></div><div className="track"><span style={{ width: `${Math.max(value ? 4 : 0, value / max * 100)}%`, opacity: 1 - index * .07 }} /></div></div>)}</div></div>;
 }
@@ -38,7 +38,7 @@ function Pipeline({ run }: { run?: Run }) {
 function QueuePressure({ queues }: { queues: ReturnType<typeof useDashboard>['data']['queues'] }) {
   const entries = Object.entries(queues);
   if (!entries.length) return <EmptyState icon={CheckCircle2} title="Queues are connecting" detail="Queue counts will appear after Redis is ready." />;
-  return <div className="queue-list">{entries.map(([name, counts]) => <div className="queue-row" key={name}><div><strong>{name}</strong><small>{counts.completed} done · {counts.failed} failed</small></div><div><b>{counts.waiting + counts.active + counts.delayed}</b><span>{counts.active ? `${counts.active} active` : 'pending'}</span></div></div>)}</div>;
+  return <div className="queue-list">{entries.map(([name, counts]) => <div className="queue-row" key={name}><div><strong>{name}</strong><small>{counts.completed} recent done · {counts.failed} failed</small></div><div><b>{counts.waiting + counts.active + counts.delayed}</b><span>{counts.active ? `${counts.active} active` : 'pending'}</span></div></div>)}</div>;
 }
 
 function ratio(value: number, total: number) {

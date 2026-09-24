@@ -1,5 +1,6 @@
 import pg from 'pg';
 import { config } from './config.js';
+import { runIsStopped } from './run-control.js';
 import { normalizeDomain, normalizeName, type BusinessCandidate, type CreateRunInput } from './domain.js';
 
 const { Pool } = pg;
@@ -37,10 +38,10 @@ export async function getRun(id: string) {
 }
 
 export async function isRunCancelled(id: string) {
-  const result = await pool.query<{ cancelled: boolean }>(
-    `SELECT status='cancelled' AS cancelled FROM discovery_runs WHERE id=$1`, [id],
+  const result = await pool.query<{ status: string }>(
+    `SELECT status FROM discovery_runs WHERE id=$1`, [id],
   );
-  return result.rows[0]?.cancelled ?? true;
+  return runIsStopped(result.rows[0]?.status);
 }
 
 export async function cancelPendingCompanies(runId: string) {
@@ -59,19 +60,21 @@ export async function setRunStatus(id: string, status: string, error?: string) {
   await pool.query(
     `UPDATE discovery_runs SET status = $2, error = $3,
        started_at = CASE WHEN $2 = 'running' AND started_at IS NULL THEN now() ELSE started_at END,
-       completed_at = CASE WHEN $2 IN ('completed','failed','cancelled') THEN now() ELSE completed_at END
-     WHERE id = $1`,
+       completed_at = CASE WHEN $2 IN ('completed','failed','cancelled') THEN now()
+         WHEN $2='running' THEN NULL ELSE completed_at END
+     WHERE id = $1 AND status <> 'cancelled'`,
     [id, status, error ?? null],
   );
 }
 
 export async function markDiscoveryFinished(id: string) {
-  await pool.query('UPDATE discovery_runs SET discovery_finished_at=now() WHERE id=$1', [id]);
+  await pool.query("UPDATE discovery_runs SET discovery_finished_at=now() WHERE id=$1 AND status='running'", [id]);
 }
 
 const terminalCompanyStatuses = [
   'filtered_out', 'unqualified', 'no_contact', 'no_email', 'email_risky',
   'invalid_email', 'contact_found', 'email_verified', 'drafted', 'contacted', 'failed', 'cancelled',
+  'replied', 'interested', 'unsubscribed', 'bounced',
 ];
 
 export async function maybeCompleteRun(runId: string) {
@@ -79,6 +82,8 @@ export async function maybeCompleteRun(runId: string) {
     `SELECT discovery_finished_at IS NOT NULL
        AND NOT EXISTS (
          SELECT 1 FROM companies WHERE run_id=$1 AND NOT (status = ANY($2::text[]))
+       ) AND NOT EXISTS (
+         SELECT 1 FROM qualifications q JOIN companies c ON c.id=q.company_id WHERE c.run_id=$1 AND q.ai_status='pending'
        ) AS ready
      FROM discovery_runs WHERE id=$1`,
     [runId, terminalCompanyStatuses],
@@ -136,13 +141,15 @@ export async function getCompany(id: string) {
 
 export async function updateCompanyFilter(id: string, score: number, reasons: string[], status: string) {
   await pool.query(
-    'UPDATE companies SET filter_score = $2, filter_reasons = $3, status = $4 WHERE id = $1',
+    `UPDATE companies SET filter_score = $2, filter_reasons = $3, status = $4 WHERE id = $1
+      AND EXISTS (SELECT 1 FROM discovery_runs r WHERE r.id=companies.run_id AND r.status NOT IN ('cancelled','failed'))`,
     [id, score, JSON.stringify(reasons), status],
   );
 }
 
 export async function updateCompanyStatus(id: string, status: string) {
-  await pool.query('UPDATE companies SET status = $2 WHERE id = $1', [id, status]);
+  await pool.query(`UPDATE companies SET status = $2 WHERE id = $1
+    AND EXISTS (SELECT 1 FROM discovery_runs r WHERE r.id=companies.run_id AND r.status NOT IN ('cancelled','failed'))`, [id, status]);
 }
 
 export async function saveEvidence(companyId: string, evidence: Record<string, unknown>) {
@@ -203,17 +210,18 @@ export async function mergePublicContactEvidence(companyId: string, value: Publi
 export async function saveQualification(companyId: string, value: {
   qualified: boolean; score: number; opportunity: string; painPoints: string[];
   recommendedRole: string; rationale?: string; model?: string; scoreBreakdown?: Record<string, unknown>;
+  aiStatus?: string;
 }) {
   await pool.query(
     `INSERT INTO qualifications
-       (company_id,qualified,score,opportunity,pain_points,recommended_role,rationale,model,score_breakdown)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+       (company_id,qualified,score,opportunity,pain_points,recommended_role,rationale,model,score_breakdown,ai_status)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
      ON CONFLICT (company_id) DO UPDATE SET qualified=EXCLUDED.qualified,score=EXCLUDED.score,
        opportunity=EXCLUDED.opportunity,pain_points=EXCLUDED.pain_points,
        recommended_role=EXCLUDED.recommended_role,rationale=EXCLUDED.rationale,model=EXCLUDED.model,
-       score_breakdown=EXCLUDED.score_breakdown`,
+       score_breakdown=EXCLUDED.score_breakdown,ai_status=EXCLUDED.ai_status`,
     [companyId, value.qualified, value.score, value.opportunity, value.painPoints,
-      value.recommendedRole, value.rationale ?? null, value.model ?? null, value.scoreBreakdown ?? {}],
+      value.recommendedRole, value.rationale ?? null, value.model ?? null, value.scoreBreakdown ?? {}, value.aiStatus ?? 'not_requested'],
   );
 }
 
@@ -255,15 +263,37 @@ export async function logEvent(runId: string, stage: string, message: string, co
 export async function refreshRunStats(runId: string) {
   await pool.query(
     `UPDATE discovery_runs r SET stats = jsonb_build_object(
+       'target', r.target_count,
        'discovered', (SELECT count(*) FROM companies c WHERE c.run_id=r.id),
        'filtered', (SELECT count(*) FROM companies c WHERE c.run_id=r.id AND c.status NOT IN ('discovered','filtered_out')),
+       'evaluated', (SELECT count(*) FROM companies c JOIN qualifications q ON q.company_id=c.id WHERE c.run_id=r.id),
+       'ai_pending', (SELECT count(*) FROM companies c JOIN qualifications q ON q.company_id=c.id WHERE c.run_id=r.id AND q.ai_status='pending'),
+       'ai_explained', (SELECT count(*) FROM companies c JOIN qualifications q ON q.company_id=c.id WHERE c.run_id=r.id AND q.ai_status='completed'),
        'qualified', (SELECT count(*) FROM companies c JOIN qualifications q ON q.company_id=c.id WHERE c.run_id=r.id AND q.qualified),
-       'contacts', (SELECT count(*) FROM contacts x JOIN companies c ON c.id=x.company_id WHERE c.run_id=r.id),
-       'verified', (SELECT count(*) FROM contact_emails e JOIN companies c ON c.id=e.company_id WHERE c.run_id=r.id AND e.verification_status='valid'),
+       'contacts', (SELECT count(DISTINCT x.company_id) FROM contacts x JOIN companies c ON c.id=x.company_id WHERE c.run_id=r.id),
+       'verified', (SELECT count(DISTINCT e.company_id) FROM contact_emails e JOIN companies c ON c.id=e.company_id WHERE c.run_id=r.id AND e.verification_status='valid'),
+       'pending', (SELECT count(*) FROM companies c WHERE c.run_id=r.id AND NOT (c.status = ANY($2::text[]))),
+       'finished', (SELECT count(*) FROM companies c WHERE c.run_id=r.id AND c.status = ANY($2::text[])),
        'contacted', (SELECT count(*) FROM messages m WHERE m.run_id=r.id AND m.direction='outbound' AND m.status IN ('sent','delivered'))
      ) WHERE r.id=$1`,
-    [runId],
+    [runId, terminalCompanyStatuses],
   );
+}
+
+export async function qualificationSummary() {
+  const result = await pool.query(`SELECT
+    count(*)::int AS evaluated,
+    count(*) FILTER (WHERE qualified)::int AS qualified,
+    count(*) FILTER (WHERE NOT qualified)::int AS not_qualified,
+    count(*) FILTER (WHERE opportunity='new_website')::int AS new_website,
+    count(*) FILTER (WHERE opportunity='website_improvement')::int AS website_improvement,
+    count(*) FILTER (WHERE opportunity='website_present')::int AS website_present,
+    count(*) FILTER (WHERE opportunity='manual_review')::int AS manual_review,
+    count(*) FILTER (WHERE ai_status='completed')::int AS ai_explained,
+    count(*) FILTER (WHERE ai_status='pending')::int AS ai_pending,
+    count(*) FILTER (WHERE ai_status='fallback')::int AS ai_fallback
+    FROM qualifications`);
+  return result.rows[0];
 }
 
 export async function dashboardOverview() {
@@ -349,7 +379,7 @@ export async function getBusinessDetail(id: string) {
   return result.rows[0];
 }
 
-export async function listQualifications(input: { qualified?: boolean | undefined; opportunity?: string | undefined; limit?: number | undefined } = {}) {
+export async function listQualifications(input: { qualified?: boolean | undefined; opportunity?: string | undefined; limit?: number | undefined; offset?: number | undefined } = {}) {
   const limit = Math.min(Math.max(input.limit ?? 100, 1), 250);
   const result = await pool.query(
     `WITH ranked AS (
@@ -378,8 +408,8 @@ export async function listQualifications(input: { qualified?: boolean | undefine
      FROM ranked
      WHERE ($1::boolean IS NULL OR qualified=$1)
        AND ($2='' OR opportunity=$2)
-     ORDER BY score DESC,run_rank,created_at DESC LIMIT $3`,
-    [input.qualified ?? null, input.opportunity ?? '', limit],
+     ORDER BY score DESC,run_rank,created_at DESC,id LIMIT $3 OFFSET $4`,
+    [input.qualified ?? null, input.opportunity ?? '', limit, Math.max(input.offset ?? 0, 0)],
   );
   return result.rows;
 }

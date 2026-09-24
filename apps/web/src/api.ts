@@ -1,9 +1,15 @@
 export type RunStats = {
+  ai_pending?: number;
+  ai_explained?: number;
+  target?: number;
   discovered: number;
   filtered: number;
+  evaluated?: number;
   qualified: number;
   contacts: number;
   verified: number;
+  pending?: number;
+  finished?: number;
   contacted: number;
 };
 
@@ -17,6 +23,7 @@ export type Run = {
   status: string;
   provider_mode: string;
   stats: RunStats;
+  discovery_state?: { cursor?: number; keywords?: string[]; reason?: string };
   error?: string;
   created_at: string;
   updated_at?: string;
@@ -75,6 +82,7 @@ export type Qualification = {
   recommended_role: string;
   rationale?: string;
   model?: string;
+  ai_status?: string;
   has_website: boolean;
   score_breakdown?: ScoreBreakdown;
   run_rank: number;
@@ -85,6 +93,19 @@ export type Qualification = {
   email_count: number;
   review_count: number;
   created_at: string;
+};
+
+export type QualificationSummary = {
+  evaluated: number;
+  qualified: number;
+  not_qualified: number;
+  new_website: number;
+  website_improvement: number;
+  website_present: number;
+  manual_review: number;
+  ai_explained: number;
+  ai_pending: number;
+  ai_fallback: number;
 };
 
 export type ScoreBreakdown = {

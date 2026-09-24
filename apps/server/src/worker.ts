@@ -1,5 +1,7 @@
-import { Worker, type Job } from 'bullmq';
+import { DelayedError, Worker, type Job } from 'bullmq';
 import { config } from './config.js';
+import { RunPausedError } from './run-control.js';
+import { reconcileActiveRuns, stageQueues } from './reconcile.js';
 import {
   closeDatabase, createMessage, eligibleEmail, getCompany, getEvidence, getRun, insertCompany, isRunCancelled, pool,
   logEvent, markDiscoveryFinished, maybeCompleteRun, refreshRunStats, saveContact, saveEmail,
@@ -8,7 +10,7 @@ import {
 import { calculateFilterScore, type BusinessCandidate, type CreateRunInput } from './domain.js';
 import { closeQueues, connection, enqueue } from './queues.js';
 import {
-  crawlWebsite, discoverBusinesses, enrichEmails, findDecisionMakers, parseOwner, parseStringList,
+  buildDiscoveryKeywords, crawlWebsite, discoverBusinesses, enrichEmails, findDecisionMakers, parseOwner, parseStringList,
   qualifyBusiness, researchPublicContacts, sendWithPosta,
 } from './providers.js';
 
@@ -19,19 +21,47 @@ const workers: Worker[] = [];
 const refreshCounters = new Map<string, { count: number; refreshedAt: number }>();
 
 function addWorker(name: string, processor: (job: Job) => Promise<unknown>, concurrency: number, limiter?: { max: number; duration: number }) {
-  const guardedProcessor = async (job: Job) => {
-    const data = job.data as Partial<RunJob> | undefined;
-    if (data?.runId && await isRunCancelled(data.runId)) return { cancelled: true };
-    return processor(job);
+  const guardedProcessor = async (job: Job, token?: string) => {
+    try {
+      const data = job.data as Partial<CompanyJob> | undefined;
+      if (data?.runId && await isRunCancelled(data.runId)) return { cancelled: true };
+      if (data?.companyId) {
+        const company = await getCompany(data.companyId);
+        if (!company) return;
+        if (name !== 'ai' && stageQueues[company.status] !== name) return { superseded: true };
+        if (name === 'ai') {
+          const row = await pool.query("SELECT ai_status FROM qualifications WHERE company_id=$1", [company.id]);
+          if (row.rows[0]?.ai_status !== 'pending') return { superseded: true };
+        }
+      }
+      return await processor(job);
+    } catch (error) {
+      if (!(error instanceof RunPausedError)) throw error;
+      // Delayed jobs retain their ID and checkpoint and do not consume retries.
+      await job.moveToDelayed(Date.now() + 30_000, token);
+      throw new DelayedError();
+    }
   };
   const worker = new Worker(name, guardedProcessor, { connection, concurrency, ...(limiter ? { limiter } : {}) });
   worker.on('completed', (job) => console.log(`[${name}] completed ${job.id}`));
   worker.on('failed', async (job, error) => {
     console.error(`[${name}] failed ${job?.id}:`, error.message);
     const data = job?.data as Partial<CompanyJob> | undefined;
+    if (name === 'discovery' && job && job.attemptsMade >= (job.opts.attempts ?? 1) && data?.runId) {
+      const run = await getRun(data.runId).catch(() => undefined);
+      if (run && !['paused','cancelled'].includes(run.status)) {
+        await setRunStatus(data.runId, 'failed', error.message).catch(() => undefined);
+        await logEvent(data.runId, 'discovery', error.message).catch(() => undefined);
+      }
+    }
     if (job && job.attemptsMade >= (job.opts.attempts ?? 1) && data?.companyId && data.runId) {
-      if (await isRunCancelled(data.runId)) return;
-      await updateCompanyStatus(data.companyId, 'failed').catch(() => undefined);
+      const run = await getRun(data.runId).catch(() => undefined);
+      if (!run || run.status === 'cancelled') return;
+      if (name === 'ai') {
+        await pool.query("UPDATE qualifications SET ai_status='fallback' WHERE company_id=$1", [data.companyId]).catch(() => undefined);
+      } else {
+        await updateCompanyStatus(data.companyId, 'failed').catch(() => undefined);
+      }
       await logEvent(data.runId, name, error.message, data.companyId).catch(() => undefined);
       await maybeCompleteRun(data.runId).catch(() => undefined);
     }
@@ -41,31 +71,58 @@ function addWorker(name: string, processor: (job: Job) => Promise<unknown>, conc
 
 addWorker('discovery', async (job: Job<RunJob>) => {
   const run = await getRun(job.data.runId);
-  if (!run || run.status === 'cancelled') return;
-  await setRunStatus(run.id, 'running');
-  await logEvent(run.id, 'discovery', `Building queries for ${run.business_types.length} business types across ${run.cities.length} cities`);
+  if (!run || run.discovery_finished_at || await isRunCancelled(run.id)) return;
+  await pool.query("UPDATE discovery_runs SET status='running',started_at=COALESCE(started_at,now()),completed_at=NULL WHERE id=$1 AND status='queued'", [run.id]);
   const input: CreateRunInput = {
     name: run.name, country: run.country, cities: run.cities, businessTypes: run.business_types,
     targetCount: Math.min(run.target_count, config.MAX_DISCOVERY_RESULTS),
   };
-  try {
-    const businesses = await discoverBusinesses(input, () => isRunCancelled(run.id));
-    if (await isRunCancelled(run.id)) return { cancelled: true };
+  const state = run.discovery_state ?? {};
+  const keywords: string[] = state.keywords ?? buildDiscoveryKeywords(input);
+  let cursor = Number(state.cursor ?? 0);
+  let jobId: string | undefined = state.jobId;
+  const saveState = async (reason?: string) => {
+    await pool.query('UPDATE discovery_runs SET discovery_state=$2 WHERE id=$1',
+      [run.id, { keywords, cursor, jobId, ...(reason ? { reason } : {}) }]);
+  };
+  await saveState();
+  let count = Number((await pool.query('SELECT count(*) FROM companies WHERE run_id=$1', [run.id])).rows[0].count);
+  while (cursor < keywords.length && count < input.targetCount) {
+    if (await isRunCancelled(run.id)) return;
+    await logEvent(run.id, 'discovery', `Search batch ${cursor + 1}/${keywords.length}; ${count}/${input.targetCount} unique businesses stored`);
+    const businesses = await discoverBusinesses(
+      input,
+      () => isRunCancelled(run.id),
+      { keywords: [keywords[cursor]!], ...(jobId ? { jobId } : {}),
+        saveJob: async (id) => { jobId = id; await saveState(); } },
+    );
+    if (await isRunCancelled(run.id)) return;
     for (const business of businesses) {
+      if (count >= input.targetCount || await isRunCancelled(run.id)) break;
       business.country ||= input.country;
       const company = await insertCompany(run.id, business);
-      await enqueue('filter', 'filter-company', { runId: run.id, companyId: company.id }, `filter:${company.id}`);
+      if (company.status === 'discovered') {
+        await enqueue('filter', 'filter-company', { runId: run.id, companyId: company.id }, `filter:${company.id}`);
+      }
+      count = Number((await pool.query('SELECT count(*) FROM companies WHERE run_id=$1', [run.id])).rows[0].count);
     }
-    await markDiscoveryFinished(run.id);
+    if (await isRunCancelled(run.id)) return;
+    cursor += 1;
+    jobId = undefined;
+    await saveState();
     await refreshRunStats(run.id);
-    await logEvent(run.id, 'discovery', `Discovery finished with ${businesses.length} unique candidates`);
-    await maybeCompleteRun(run.id);
-    return { discovered: businesses.length };
-  } catch (error) {
-    await setRunStatus(run.id, 'failed', error instanceof Error ? error.message : String(error));
-    throw error;
   }
-}, config.DISCOVERY_CONCURRENCY);
+  if (await isRunCancelled(run.id)) return;
+  const reason = count >= input.targetCount ? 'target_reached' : 'search_plan_exhausted';
+  await saveState(reason);
+  await markDiscoveryFinished(run.id);
+  await refreshRunStats(run.id);
+  await logEvent(run.id, 'discovery', reason === 'target_reached'
+    ? `Discovery target reached: ${count}/${input.targetCount}. Remaining stages are processing.`
+    : `Search plan exhausted: ${count}/${input.targetCount} unique businesses. Add cities or categories to broaden coverage; no results were fabricated.`);
+  await maybeCompleteRun(run.id);
+  return { discovered: count, reason };
+}, 1);
 
 addWorker('filter', async (job: Job<CompanyJob>) => {
   const company = await getCompany(job.data.companyId) as BusinessCandidate & { id: string; run_id: string; review_count: number };
@@ -104,17 +161,38 @@ addWorker('qualify', async (job: Job<CompanyJob>) => {
   const company = await getCompany(job.data.companyId);
   if (!company) return;
   const evidence = await getEvidence(company.id);
-  const qualification = await qualifyBusiness(fromCompany(company), evidence);
+  const qualification = await qualifyBusiness(fromCompany(company), evidence, false);
   if (await isRunCancelled(company.run_id)) return { cancelled: true };
-  await saveQualification(company.id, qualification);
+  await saveQualification(company.id, { ...qualification,
+    aiStatus: qualification.qualified && company.website && config.PROVIDER_MODE === 'live' ? 'pending' : 'not_requested',
+  });
   if (!qualification.qualified) {
     await updateCompanyStatus(company.id, 'unqualified');
     await finishOne(company.run_id);
     return;
   }
+  if (company.website && config.PROVIDER_MODE === 'live') {
+    await enqueue('ai', 'explain-qualification', job.data, `ai:${company.id}`);
+  }
   await updateCompanyStatus(company.id, 'research_queued');
   await enqueue('research', 'find-decision-maker', job.data, `research:${company.id}`);
   await maybeRefresh(company.run_id);
+}, 6);
+
+addWorker('ai', async (job: Job<CompanyJob>) => {
+  const company = await getCompany(job.data.companyId);
+  if (!company) return;
+  const evidence = await getEvidence(company.id);
+  const qualification = await qualifyBusiness(fromCompany(company), evidence, true);
+  if (await isRunCancelled(company.run_id)) return { cancelled: true };
+  // AI may explain the assessment, never silently change the routing/score
+  // after contact research has already begun.
+  await pool.query(`UPDATE qualifications SET rationale=$2,model=$3,ai_status=$4
+    WHERE company_id=$1 AND ai_status='pending'`, [
+    company.id, qualification.rationale, qualification.model,
+    qualification.model === config.OLLAMA_MODEL ? 'completed' : 'fallback',
+  ]);
+  await finishOne(company.run_id);
 }, config.AI_CONCURRENCY);
 
 addWorker('research', async (job: Job<CompanyJob>) => {
@@ -155,7 +233,7 @@ addWorker('research', async (job: Job<CompanyJob>) => {
     return;
   }
   await updateCompanyStatus(company.id, 'enrich_queued');
-  await enqueue('enrich', 'enrich-email', { ...job.data, contactId: saved.id }, `enrich:${company.id}:${saved.id}`);
+  await enqueue('enrich', 'enrich-email', { ...job.data, contactId: saved.id }, `enrich:${company.id}`);
   await maybeRefresh(company.run_id);
 }, config.SEARCH_CONCURRENCY);
 
@@ -165,7 +243,7 @@ addWorker('enrich', async (job: Job<CompanyJob & { contactId: string }>) => {
   const evidence = await getEvidence(company.id);
   const contactResult = await pool.query('SELECT * FROM contacts WHERE id=$1', [job.data.contactId]);
   const contact = contactResult.rows[0];
-  if (!contact) return;
+  if (!contact) throw new Error('Enrichment contact is missing; retry research for this business');
   const sources = Array.isArray(evidence?.contact_sources) ? evidence.contact_sources : [];
   const results = await enrichEmails(fromCompany(company), contact.full_name, sources, evidence?.emails ?? []);
   if (await isRunCancelled(company.run_id)) return { cancelled: true };
@@ -188,7 +266,7 @@ addWorker('enrich', async (job: Job<CompanyJob & { contactId: string }>) => {
   }
   await updateCompanyStatus(company.id, 'campaign_queued');
   const campaignEmail = savedEmails[validIndex]!;
-  await enqueue('campaign', 'prepare-message', { ...job.data, emailId: campaignEmail.id }, `campaign:${campaignEmail.id}`);
+  await enqueue('campaign', 'prepare-message', { ...job.data, emailId: campaignEmail.id }, `campaign:${company.id}`);
   await maybeRefresh(company.run_id);
 }, config.ENRICHMENT_CONCURRENCY);
 
@@ -240,7 +318,19 @@ async function finishOne(runId: string) {
   await maybeCompleteRun(runId);
 }
 
+let reconciling = false;
+async function reconcile() {
+  if (reconciling) return;
+  reconciling = true;
+  try { await reconcileActiveRuns(); }
+  catch (error) { console.error('Pipeline recovery failed:', error); }
+  finally { reconciling = false; }
+}
+const recoveryTimer = setInterval(() => void reconcile(), 30_000);
+void reconcile();
+
 async function shutdown(signal: string) {
+  clearInterval(recoveryTimer);
   console.log(`Received ${signal}; closing workers`);
   await Promise.all(workers.map((worker) => worker.close()));
   await closeQueues();

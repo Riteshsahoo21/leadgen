@@ -55,7 +55,7 @@ services:
 
   redis:
     image: redis:7.4-alpine
-    command: ["redis-server", "--appendonly", "yes", "--maxmemory", "96mb", "--maxmemory-policy", "noeviction"]
+    command: ["redis-server", "--appendonly", "yes", "--maxmemory", "192mb", "--maxmemory-policy", "noeviction"]
     volumes:
       - redis_data:/data
     healthcheck:
@@ -64,8 +64,8 @@ services:
       timeout: 3s
       retries: 10
     restart: unless-stopped
-    mem_limit: 160m
-    memswap_limit: 160m
+    mem_limit: 320m
+    memswap_limit: 320m
     pids_limit: 100
     networks: [private]
 
@@ -155,8 +155,8 @@ services:
       - gmaps_data:/gmapsdata
       - ./secrets/gmaps-proxies.txt:/run/secrets/gmaps-proxies.txt:ro
     restart: unless-stopped
-    mem_limit: 512m
-    memswap_limit: 512m
+    mem_limit: 1024m
+    memswap_limit: 1024m
     shm_size: 96m
     pids_limit: 300
     networks: [private]

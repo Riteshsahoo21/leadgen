@@ -34,12 +34,15 @@ export function safeBusinesses(input: CreateRunInput): BusinessCandidate[] {
 export async function discoverBusinesses(
   input: CreateRunInput,
   shouldStop?: () => Promise<boolean>,
+  checkpoint?: { jobId?: string; keywords: string[]; saveJob: (id: string) => Promise<void> },
 ): Promise<BusinessCandidate[]> {
   if (config.PROVIDER_MODE === 'safe') return safeBusinesses(input);
   if (await shouldStop?.()) return [];
 
-  const keywords = input.cities.flatMap((city) => input.businessTypes.map((type) => `${type} in ${city}, ${input.country}`));
+  const keywords = checkpoint?.keywords ?? buildDiscoveryKeywords(input);
   const depth = mapsDepthFor(input.targetCount, keywords.length);
+  let jobId = checkpoint?.jobId;
+  if (!jobId) {
   const response = await fetch(`${config.GMAPS_API_URL}/api/v1/jobs`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
@@ -49,7 +52,7 @@ export async function discoverBusinesses(
       lang: 'en',
       depth,
       email: true,
-      max_time: Math.min(1_200, Math.max(300, depth * keywords.length * 12)),
+      max_time: 300,
       max_results: Math.min(input.targetCount, config.MAX_DISCOVERY_RESULTS),
     }),
     signal: AbortSignal.timeout(30_000),
@@ -57,9 +60,11 @@ export async function discoverBusinesses(
   if (!response.ok) throw new Error(`Maps service rejected the job (${response.status}): ${await response.text()}`);
   const payload = await response.json() as Record<string, any>;
   const immediateResults = payload.results ?? payload.Results;
-  if (Array.isArray(immediateResults)) return immediateResults.map(mapMapsResult).slice(0, input.targetCount);
-  const jobId = String(payload.id ?? payload.ID ?? payload.job_id ?? payload.job?.id ?? '');
+  if (Array.isArray(immediateResults)) return uniqueBusinessCandidates(immediateResults.map(mapMapsResult), input.targetCount);
+  jobId = String(payload.id ?? payload.ID ?? payload.job_id ?? payload.job?.id ?? '');
   if (!jobId) throw new Error('Maps service returned neither results nor a job ID');
+  await checkpoint?.saveJob(jobId);
+  }
   for (let attempt = 0; attempt < 180; attempt += 1) {
     if (await shouldStop?.()) return [];
     await delay(10_000);
@@ -68,14 +73,14 @@ export async function discoverBusinesses(
     if (!statusResponse.ok) throw new Error(`Maps job status failed (${statusResponse.status})`);
     const statusPayload = await statusResponse.json() as Record<string, any>;
     const statusResults = statusPayload.results ?? statusPayload.Results;
-    if (Array.isArray(statusResults)) return statusResults.map(mapMapsResult).slice(0, input.targetCount);
+    if (Array.isArray(statusResults)) return uniqueBusinessCandidates(statusResults.map(mapMapsResult), input.targetCount);
     const status = String(statusPayload.status ?? statusPayload.Status ?? statusPayload.state ?? statusPayload.State ?? '').toLowerCase();
     if (['failed', 'error', 'cancelled'].includes(status)) throw new Error(`Maps job ${jobId} ${status}: ${statusPayload.error ?? ''}`);
     if (['completed', 'complete', 'done', 'success', 'succeeded', 'ok'].includes(status)) {
       const download = await fetch(`${config.GMAPS_API_URL}/api/v1/jobs/${encodeURIComponent(jobId)}/download`, { signal: AbortSignal.timeout(30_000) });
       if (!download.ok) throw new Error(`Maps result download failed (${download.status})`);
       const rows = parse(await download.text(), { columns: true, skip_empty_lines: true, relax_column_count: true }) as unknown[];
-      return rows.map(mapMapsResult).slice(0, input.targetCount);
+      return uniqueBusinessCandidates(rows.map(mapMapsResult), input.targetCount);
     }
   }
   throw new Error(`Maps job ${jobId} did not complete within 30 minutes`);
@@ -83,6 +88,50 @@ export async function discoverBusinesses(
 
 export function mapsDepthFor(targetCount: number, keywordCount: number) {
   return Math.min(10, Math.max(1, Math.ceil(targetCount / Math.max(keywordCount, 1) / 15)));
+}
+
+export function buildDiscoveryKeywords(input: CreateRunInput) {
+  // Each Maps query has finite inventory. Expand large targets across geographic
+  // sections and search intents, while keeping one bounded upstream job.
+  const desired = Math.min(60, Math.max(
+    input.cities.length * input.businessTypes.length,
+    Math.ceil(input.targetCount / 100),
+  ));
+  const variants = [
+    (type: string, city: string) => `${type} in ${city}, ${input.country}`,
+    (type: string, city: string) => `${type} near ${city}, ${input.country}`,
+    (type: string, city: string) => `best ${type} in ${city}, ${input.country}`,
+    (type: string, city: string) => `top rated ${type} in ${city}, ${input.country}`,
+    (type: string, city: string) => `local ${type} in ${city}, ${input.country}`,
+    ...['central', 'north', 'south', 'east', 'west', 'northeast', 'northwest', 'southeast', 'southwest',
+      'downtown', 'old town', 'suburbs', 'business district', 'industrial area', 'near airport', 'near railway station']
+      .map((area) => (type: string, city: string) => `${type} in ${area} ${city}, ${input.country}`),
+  ];
+  const keywords: string[] = [];
+  for (const variant of variants) {
+    for (const city of input.cities) {
+      for (const type of input.businessTypes) {
+        keywords.push(variant(type, city));
+        if (keywords.length >= desired) return keywords;
+      }
+    }
+  }
+  return keywords;
+}
+
+function uniqueBusinessCandidates(candidates: BusinessCandidate[], limit: number) {
+  const seen = new Set<string>();
+  const unique: BusinessCandidate[] = [];
+  for (const candidate of candidates) {
+    const key = candidate.sourceId ? `place:${candidate.sourceId}`
+      : normalizeDomain(candidate.website) ? `domain:${normalizeDomain(candidate.website)}`
+        : candidate.phone ? `phone:${candidate.phone.replace(/\D/g, '')}`
+          : `name:${candidate.name.toLowerCase()}|${candidate.address?.toLowerCase() ?? ''}`;
+    if (seen.has(key)) continue;
+    seen.add(key); unique.push(candidate);
+    if (unique.length >= limit) break;
+  }
+  return unique;
 }
 
 function mapMapsResult(item: unknown): BusinessCandidate {
@@ -389,7 +438,7 @@ function extractStructuredData(
   });
 }
 
-export async function qualifyBusiness(candidate: BusinessCandidate, evidence?: Record<string, unknown>) {
+export async function qualifyBusiness(candidate: BusinessCandidate, evidence?: Record<string, unknown>, includeAi = true) {
   const pagesCrawled = Number(evidence?.pages_crawled ?? 0);
   const storedEvidence = evidence?.evidence && typeof evidence.evidence === 'object' ? evidence.evidence as Record<string, unknown> : {};
   const capabilities = storedEvidence.capabilities && typeof storedEvidence.capabilities === 'object' ? storedEvidence.capabilities : undefined;
@@ -417,6 +466,7 @@ export async function qualifyBusiness(candidate: BusinessCandidate, evidence?: R
   if (config.PROVIDER_MODE === 'safe') return {
     ...ruleResult, rationale: 'Deterministic safe-mode qualification using stored evidence.', model: 'rules-safe-mode',
   };
+  if (!includeAi) return ruleResult;
 
   const schema = {
     type: 'object', required: ['recommended_role','rationale'],

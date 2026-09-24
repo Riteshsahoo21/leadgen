@@ -6,8 +6,9 @@ import { config } from './config.js';
 import {
   cancelPendingCompanies, closeDatabase, createRun, dashboardOverview, databaseHealth, getRun, listRuns, pool,
   getBusinessDetail, listBusinesses, listMessages, listPipelineEvents, listQualifications,
-  logEvent, recentEvents, recentLeads, setRunStatus,
+  logEvent, qualificationSummary, recentEvents, recentLeads, setRunStatus, refreshRunStats,
 } from './db.js';
+import { reconcileRun } from './reconcile.js';
 import { createRunSchema } from './domain.js';
 import { cancelRunJobs, closeQueues, enqueue, queueSnapshot } from './queues.js';
 
@@ -76,13 +77,17 @@ app.get<{ Params: { id: string } }>('/api/businesses/:id', async (request, reply
 });
 
 app.post<{ Params: { id: string } }>('/api/businesses/:id/research', async (request, reply) => {
-  const result = await pool.query('SELECT id,run_id,website FROM companies WHERE id=$1', [request.params.id]);
+  const result = await pool.query('SELECT id,run_id,website,status FROM companies WHERE id=$1', [request.params.id]);
   const company = result.rows[0];
   if (!company) return reply.code(404).send({ error: 'Business not found' });
+  const run = await getRun(company.run_id);
+  if (['paused','cancelled','failed'].includes(run?.status)) return reply.code(409).send({ error: 'Resume the run first; stopped runs cannot be restarted.' });
+  if (company.status?.endsWith('_queued')) return reply.code(409).send({ error: 'This business is already queued.' });
+  await setRunStatus(company.run_id, 'running');
   const queue = company.website ? 'crawl' : 'qualify';
   const status = company.website ? 'crawl_queued' : 'qualify_queued';
   await pool.query('UPDATE companies SET status=$2 WHERE id=$1', [company.id, status]);
-  await enqueue(queue, 'refresh-analysis', { runId: company.run_id, companyId: company.id });
+  await enqueue(queue, 'refresh-analysis', { runId: company.run_id, companyId: company.id }, `${queue}:${company.id}`);
   return reply.code(202).send({ status });
 });
 
@@ -93,12 +98,15 @@ app.post('/api/research/backfill', async (request, reply) => {
   if (!parsed.success) return reply.code(400).send({ error: 'Invalid backfill request', issues: parsed.error.issues });
   const result = await pool.query(
     `SELECT c.id,c.run_id FROM companies c
-     WHERE NOT EXISTS (SELECT 1 FROM contact_emails e WHERE e.company_id=c.id)
+     WHERE EXISTS (SELECT 1 FROM discovery_runs r WHERE r.id=c.run_id AND r.status IN ('running','completed'))
+       AND c.status NOT IN ('discovered','crawl_queued','qualify_queued','research_queued','enrich_queued','campaign_queued','cancelled')
+       AND NOT EXISTS (SELECT 1 FROM contact_emails e WHERE e.company_id=c.id)
      ORDER BY c.updated_at DESC LIMIT $1`, [parsed.data.limit],
   );
   for (const company of result.rows) {
+    await setRunStatus(company.run_id, 'running');
     await pool.query("UPDATE companies SET status='research_queued' WHERE id=$1", [company.id]);
-    await enqueue('research', 'backfill-public-contacts', { runId: company.run_id, companyId: company.id });
+    await enqueue('research', 'backfill-public-contacts', { runId: company.run_id, companyId: company.id }, `research:${company.id}`);
   }
   return reply.code(202).send({ queued: result.rowCount ?? 0 });
 });
@@ -108,14 +116,16 @@ app.post('/api/analysis/backfill', async (request, reply) => {
   if (!parsed.success) return reply.code(400).send({ error: 'Invalid analysis backfill request', issues: parsed.error.issues });
   const result = await pool.query(
     `SELECT c.id,c.run_id,c.website FROM companies c
-     WHERE c.status NOT IN ('crawl_queued','qualify_queued','research_queued','enrich_queued','campaign_queued')
+     WHERE EXISTS (SELECT 1 FROM discovery_runs r WHERE r.id=c.run_id AND r.status IN ('running','completed'))
+       AND c.status NOT IN ('discovered','crawl_queued','qualify_queued','research_queued','enrich_queued','campaign_queued','cancelled')
      ORDER BY c.updated_at DESC LIMIT $1`, [parsed.data.limit],
   );
   for (const company of result.rows) {
+    await setRunStatus(company.run_id, 'running');
     const queue = company.website ? 'crawl' : 'qualify';
     const status = company.website ? 'crawl_queued' : 'qualify_queued';
     await pool.query('UPDATE companies SET status=$2 WHERE id=$1', [company.id, status]);
-    await enqueue(queue, 'refresh-analysis', { runId: company.run_id, companyId: company.id });
+    await enqueue(queue, 'refresh-analysis', { runId: company.run_id, companyId: company.id }, `${queue}:${company.id}`);
   }
   return reply.code(202).send({ queued: result.rowCount ?? 0 });
 });
@@ -124,7 +134,13 @@ app.get('/api/qualifications', async (request, reply) => {
   const parsed = listQuerySchema.safeParse(request.query);
   if (!parsed.success) return reply.code(400).send({ error: 'Invalid query', issues: parsed.error.issues });
   const qualified = parsed.data.qualified === undefined ? undefined : parsed.data.qualified === 'true';
-  return { qualifications: await listQualifications({ qualified, opportunity: parsed.data.opportunity, limit: parsed.data.limit }) };
+  const [qualifications, summary] = await Promise.all([
+    listQualifications({ qualified, opportunity: parsed.data.opportunity, limit: parsed.data.limit, offset: parsed.data.offset }),
+    qualificationSummary(),
+  ]);
+  const total = parsed.data.opportunity ? Number(summary[parsed.data.opportunity] ?? 0)
+    : qualified === undefined ? summary.evaluated : qualified ? summary.qualified : summary.not_qualified;
+  return { qualifications, summary, total };
 });
 
 app.get('/api/messages', async (request, reply) => {
@@ -140,6 +156,8 @@ app.get('/api/events', async (request, reply) => {
 });
 
 app.get<{ Params: { id: string } }>('/api/runs/:id', async (request, reply) => {
+  const parsed = listQuerySchema.safeParse(request.query);
+  if (!parsed.success) return reply.code(400).send({ error: 'Invalid pagination' });
   const run = await getRun(request.params.id);
   if (!run) return reply.code(404).send({ error: 'Run not found' });
   const companies = await pool.query(
@@ -149,14 +167,15 @@ app.get<{ Params: { id: string } }>('/api/runs/:id', async (request, reply) => {
        CEIL(100.0 * row_number() OVER (ORDER BY q.score DESC NULLS LAST,c.review_count DESC,c.name)
          / GREATEST(count(*) OVER (),1))::int AS top_percent
      FROM companies c LEFT JOIN qualifications q ON q.company_id=c.id
-     WHERE c.run_id=$1 ORDER BY q.score DESC NULLS LAST,c.review_count DESC,c.name LIMIT 200`, [run.id],
+     WHERE c.run_id=$1 ORDER BY q.score DESC NULLS LAST,c.review_count DESC,c.name,c.id LIMIT $2 OFFSET $3`, [run.id, parsed.data.limit ?? 100, parsed.data.offset ?? 0],
   );
-  return { run, companies: companies.rows };
+  return { run, companies: companies.rows, total: companies.rows[0]?.run_total ?? Number(run.stats?.discovered ?? 0) };
 });
 
 app.post('/api/runs', async (request, reply) => {
   const parsed = createRunSchema.safeParse(request.body);
   if (!parsed.success) return reply.code(400).send({ error: 'Invalid discovery request', issues: parsed.error.issues });
+  if (parsed.data.targetCount > config.MAX_DISCOVERY_RESULTS) return reply.code(400).send({ error: `This server supports up to ${config.MAX_DISCOVERY_RESULTS} businesses per run.` });
   const run = await createRun(parsed.data);
   await enqueue('discovery', 'discover-businesses', { runId: run.id }, `discovery:${run.id}`);
   return reply.code(202).send({ run });
@@ -172,8 +191,29 @@ app.post<{ Params: { id: string } }>('/api/runs/:id/cancel', async (request, rep
   const [removedJobs, cancelledCompanies] = await Promise.all([
     cancelRunJobs(run.id), cancelPendingCompanies(run.id),
   ]);
+  await pool.query("UPDATE qualifications q SET ai_status='cancelled' FROM companies c WHERE c.id=q.company_id AND c.run_id=$1 AND q.ai_status='pending'", [run.id]);
+  await refreshRunStats(run.id);
   await logEvent(run.id, 'cancelled', `Pipeline stopped; removed ${removedJobs} pending jobs and stopped ${cancelledCompanies} companies`);
   return { status: 'cancelled', removedJobs, cancelledCompanies };
+});
+
+app.post<{ Params: { id: string } }>('/api/runs/:id/pause', async (request, reply) => {
+  const run = await getRun(request.params.id);
+  if (!run) return reply.code(404).send({ error: 'Run not found' });
+  if (!['queued', 'running'].includes(run.status)) return reply.code(409).send({ error: `Cannot pause a ${run.status} run` });
+  await setRunStatus(run.id, 'paused');
+  await logEvent(run.id, 'paused', 'Pipeline paused. Queued jobs and discovery checkpoint retained; current external requests may finish before pausing.');
+  return { status: 'paused' };
+});
+
+app.post<{ Params: { id: string } }>('/api/runs/:id/resume', async (request, reply) => {
+  const run = await getRun(request.params.id);
+  if (!run) return reply.code(404).send({ error: 'Run not found' });
+  if (run.status !== 'paused') return reply.code(409).send({ error: `Cannot resume a ${run.status} run` });
+  await setRunStatus(run.id, 'running');
+  await reconcileRun(run.id);
+  await logEvent(run.id, 'resumed', 'Pipeline resumed from its saved checkpoint. Paused jobs continue within 30 seconds.');
+  return { status: 'running' };
 });
 
 const inboundSchema = z.object({

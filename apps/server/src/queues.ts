@@ -1,7 +1,7 @@
 import { Queue } from 'bullmq';
 import { config } from './config.js';
 
-export const queueNames = ['discovery', 'filter', 'crawl', 'qualify', 'research', 'enrich', 'campaign'] as const;
+export const queueNames = ['discovery', 'filter', 'crawl', 'qualify', 'ai', 'research', 'enrich', 'campaign'] as const;
 export type QueueName = typeof queueNames[number];
 
 const redisUrl = new URL(config.REDIS_URL);
@@ -16,8 +16,8 @@ export const connection = {
 const defaultJobOptions = {
   attempts: 3,
   backoff: { type: 'exponential' as const, delay: 2_000 },
-  removeOnComplete: { age: 86_400, count: 5_000 },
-  removeOnFail: { age: 604_800, count: 10_000 },
+  removeOnComplete: { age: 86_400, count: 500 },
+  removeOnFail: { age: 604_800, count: 500 },
 };
 
 export const queues = Object.fromEntries(
@@ -41,11 +41,15 @@ export async function queueSnapshot() {
 export async function cancelRunJobs(runId: string) {
   let removed = 0;
   for (const queue of Object.values(queues)) {
-    const jobs = await queue.getJobs(['waiting', 'delayed', 'prioritized', 'paused'], 0, -1, true);
-    for (const job of jobs) {
-      if (job.data?.runId !== runId) continue;
-      await job.remove();
-      removed += 1;
+    // Bounded pages avoid loading an entire pipeline to stop one run.
+    const count = await queue.getJobCountByTypes('waiting', 'delayed', 'prioritized', 'paused');
+    for (let end = count - 1; end >= 0; end -= 100) {
+      const jobs = await queue.getJobs(['waiting', 'delayed', 'prioritized', 'paused'], Math.max(0, end - 99), end, true);
+      for (const job of jobs) {
+        if (job.data?.runId !== runId) continue;
+        try { await job.remove(); removed += 1; }
+        catch { /* A newly active job is stopped by the processor guard. */ }
+      }
     }
   }
   return removed;
