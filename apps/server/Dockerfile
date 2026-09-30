@@ -1,17 +1,20 @@
 FROM node:22-bookworm-slim AS build
+USER root
 WORKDIR /app
+ENV NODE_ENV=development
 COPY package.json package-lock.json tsconfig.base.json ./
 COPY apps/server/package.json apps/server/package.json
 COPY apps/web/package.json apps/web/package.json
-RUN npm ci
+RUN npm ci --include=dev
 COPY apps/server apps/server
 RUN npm run build -w @leadforge/server
 
 FROM node:22-bookworm-slim AS runtime
 ENV NODE_ENV=production PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
-RUN apt-get update \
+USER root
+RUN which chromium || (apt-get update \
   && apt-get install -y --no-install-recommends chromium ca-certificates dumb-init \
-  && rm -rf /var/lib/apt/lists/*
+  && rm -rf /var/lib/apt/lists/*)
 WORKDIR /app
 COPY --from=build /app/package.json /app/package-lock.json ./
 COPY --from=build /app/apps/server/package.json apps/server/package.json
