@@ -893,7 +893,7 @@ export async function findDecisionMakers(candidate: BusinessCandidate, role = 'O
   );
   const companyTokens = candidate.name.toLowerCase().split(/[^a-z0-9]+/).filter((value) => value.length >= 3 && !['pty','ltd','the','and'].includes(value));
   const domain = normalizeDomain(candidate.website);
-  const beforePattern = /\b(?:co[ -]?founder|founder|owner|chief executive officer|ceo|managing director|director|proprietor|partner|president)\s*(?::|–|-|is|\b)\s*([A-Z][A-Za-z.'-]+(?:\s+[A-Z][A-Za-z.'-]+){1,3})\b/i;
+  const beforePattern = /\b(?:co[ -]?founder|founder|owner|chief executive officer|ceo|managing director|director|proprietor|partner|president)\s*(?::|–|-|is|at|of|\b)\s*([A-Z][A-Za-z.'-]+(?:\s+[A-Z][A-Za-z.'-]+){1,3})\b/i;
   const afterPattern = /\b([A-Z][A-Za-z.'-]+(?:\s+[A-Z][A-Za-z.'-]+){1,3})\s*(?:,|is\s+(?:the\s+)?|\s+is\s+)?\s*(?:co[ -]?founder|founder|owner|chief executive officer|ceo|managing director|director|proprietor|partner|president)\b/i;
   for (const result of results) {
     const combined = `${result.title ?? ''} ${result.content ?? ''}`;
@@ -910,7 +910,8 @@ export async function findDecisionMakers(candidate: BusinessCandidate, role = 'O
     const validContentName = extractedContentName && isLikelyPersonName(extractedContentName, candidate.name, rolePattern) ? extractedContentName : undefined;
     const rawName = titleName ?? validContentName;
     if (!rawName) continue;
-    const fullName = rawName.replace(rolePattern, '').replace(/\s+/g, ' ').trim().slice(0, 100);
+    let fullName = rawName.replace(rolePattern, '').replace(/\s+/g, ' ').trim().slice(0, 100);
+    fullName = fullName.replace(/^(?:at|of|the|for|and|in|from)\s+/i, '').trim();
     if (!isLikelyPersonName(fullName, candidate.name, rolePattern)) continue;
     contacts.push({
       fullName,
@@ -930,12 +931,15 @@ export async function findDecisionMakers(candidate: BusinessCandidate, role = 'O
 }
 
 function isLikelyPersonName(value: string, companyName: string, rolePattern: RegExp) {
-  const clean = value.replace(rolePattern, '').replace(/\s+/g, ' ').trim();
+  let clean = value.replace(rolePattern, '').replace(/\s+/g, ' ').trim();
+  clean = clean.replace(/^(?:at|of|the|for|and|in|from)\s+/i, '').trim();
   const words = clean.split(' ').filter(Boolean);
-  if (words.length < 2 || words.length > 5 || clean.length > 100) return false;
+  if (words.length < 2 || words.length > 4 || clean.length > 70) return false;
   if (!/^[A-Za-z][A-Za-z.'-]*(?:\s+[A-Za-z][A-Za-z.'-]*)+$/.test(clean)) return false;
   if (clean.toLowerCase() === companyName.toLowerCase()) return false;
-  return !/\b(company|business|official|profile|linkedin|facebook|instagram|services|solutions|private|limited|ltd)\b/i.test(clean);
+  const companyTokens = companyName.toLowerCase().split(/[^a-z0-9]+/).filter((t) => t.length >= 3 && !['pty','ltd','the','and','for'].includes(t));
+  if (companyTokens.some((t) => clean.toLowerCase().includes(t))) return false;
+  return !/\b(company|business|official|profile|linkedin|facebook|instagram|services|solutions|private|limited|ltd|llc|inc|corp|co|equipment|machinery|trading|factory|industries|industry|products|manufacturer|group|enterprise|enterprises)\b/i.test(clean);
 }
 
 export function searchResultMatchesBusiness(result: PublicSearchResult, candidate: BusinessCandidate) {
