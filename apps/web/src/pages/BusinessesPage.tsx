@@ -25,10 +25,10 @@ export function BusinessesPage() {
       setData(response); setError('');
     } catch (reason) { setError(reason instanceof Error ? reason.message : String(reason)); }
     finally { setLoading(false); }
-  }, 5_000, `${search}:${status}:${page}`);
+  }, 2_500, `${search}:${status}:${page}`);
 
   return <>
-    <PageHeader eyebrow="LEAD DATABASE" title="Businesses" description="Maps discovery counts unique businesses. Website crawling and qualification process them in parallel. A 5,000 target is 5,000 discovered businesses, not 5,000 qualified leads." />
+    <PageHeader eyebrow="LEAD DATABASE" title="Businesses" description="Maps discovery counts unique businesses. Website crawling and qualification process them in parallel. Run targets count qualified leads; discovery can scan more businesses to reach them." />
     <section className="stats-grid stats-grid-three">
       <StatCard label="Businesses discovered" value={dashboard.overview.businesses} note="Unique Maps records saved" icon={Building2} />
       <StatCard label="Websites crawled" value={dashboard.overview.websites_crawled ?? 0} note="Businesses with successfully checked pages" icon={Globe} tone="cyan" />

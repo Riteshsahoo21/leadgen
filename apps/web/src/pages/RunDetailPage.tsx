@@ -19,7 +19,7 @@ export function RunDetailPage() {
       setRun(value.run); setCompanies(value.companies); setTotal(value.total); setError('');
     } catch (reason) { setError(reason instanceof Error ? reason.message : String(reason)); }
   }
-  usePolling(load, 5_000, `${id}:${page}`);
+  usePolling(load, 2_500, `${id}:${page}`);
   if (!run) return error ? <div className="alert">{error}</div> : <LoadingRows count={8} />;
   const state = run.discovery_state;
   return <>
@@ -28,8 +28,10 @@ export function RunDetailPage() {
     {error && <div className="alert">{error}</div>}
     {run.error && <div className="alert">{run.error}</div>}
     <p className="run-progress" aria-live="polite">
-      {formatNumber(run.stats.discovered)} / {formatNumber(run.target_count)} unique businesses discovered.
-      {' '}{run.stats.pending ?? 0} businesses processing; {run.stats.ai_pending ?? 0} AI explanations pending.
+      {formatNumber(run.stats.qualified)} / {formatNumber(run.target_count)} qualified leads
+      {' '}({formatNumber(run.stats.no_website ?? 0)} / {formatNumber(Math.ceil(run.target_count * 0.6))} without a website;
+      {' '}{formatNumber(run.stats.incomplete_website ?? 0)} / {formatNumber(run.target_count - Math.ceil(run.target_count * 0.6))} with an incomplete website).
+      {' '}{formatNumber(run.stats.discovered)} businesses discovered; {run.stats.pending ?? 0} processing.
       {state?.keywords && <> Search batches: {state.cursor ?? 0} / {state.keywords.length}.</>}
       {state?.reason === 'search_plan_exhausted' && <> Search coverage exhausted below target. Add more cities or categories for additional unique results.</>}
       {run.status === 'paused' && <> Paused; queued work is retained. A current external request may finish.</>}

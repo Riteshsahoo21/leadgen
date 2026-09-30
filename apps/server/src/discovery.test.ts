@@ -16,6 +16,12 @@ describe('bounded Maps jobs and resumable checkpoints', () => {
       expect(keywords).toContain(`${category} in ${city}, India`);
     }
   });
+  it('adds distinct construction intents before broad local variants', () => {
+    const keywords = buildDiscoveryKeywords({ ...input, cities: ['Bhubaneswar'], businessTypes: ['construction'], targetCount: 50, maxDiscovery: 200 });
+    expect(keywords).toContain('building contractors in Bhubaneswar, India');
+    expect(keywords).toContain('civil contractors in Bhubaneswar, India');
+    expect(keywords).toContain('construction in Bhubaneswar, India');
+  });
   it('submits the actual upstream depth/time fields and saves the Maps job ID', async () => {
     config.PROVIDER_MODE = 'live'; vi.useFakeTimers();
     const fetchMock = vi.fn()
@@ -26,7 +32,7 @@ describe('bounded Maps jobs and resumable checkpoints', () => {
     const result = discoverBusinesses(input, async () => false, { keywords: ['dentist in Mumbai, India'], saveJob });
     await vi.advanceTimersByTimeAsync(10_000);
     expect(await result).toMatchObject([{ sourceId: 'place1', phone: '+919999999999', publicEmails: ['owner@example.org'] }]);
-    expect(JSON.parse(fetchMock.mock.calls[0]![1].body)).toMatchObject({ depth: 10, max_time: 300, email: true, keywords: ['dentist in Mumbai, India'] });
+    expect(JSON.parse(fetchMock.mock.calls[0]![1].body)).toMatchObject({ depth: 10, max_time: 60, email: false, keywords: ['dentist in Mumbai, India'] });
     expect(saveJob).toHaveBeenCalledExactlyOnceWith('maps-checkpoint');
   });
   it('resumes polling a saved job without submitting a duplicate Maps request', async () => {

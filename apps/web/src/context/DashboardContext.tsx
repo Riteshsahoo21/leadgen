@@ -47,7 +47,7 @@ export function DashboardProvider({ children }: { children: ReactNode }) {
 
   useEffect(() => {
     void refresh();
-    const timer = window.setInterval(() => void refresh(true), 5000);
+    const timer = window.setInterval(() => void refresh(true), 2500);
     return () => window.clearInterval(timer);
   }, [refresh]);
 

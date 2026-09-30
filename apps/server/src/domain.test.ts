@@ -22,18 +22,66 @@ describe('comparative qualification scoring', () => {
     });
     expect(missing.opportunity).toBe('new_website');
     expect(incomplete.opportunity).toBe('website_improvement');
-    expect(incomplete.painPoints).toHaveLength(2);
+    expect(incomplete.painPoints).toHaveLength(1);
   });
 
   it('keeps complete sites below actionable scores and varies scores by business strength', () => {
     const complete = calculateQualificationScore({ ...base, website: 'https://acme.test' }, {
-      pagesCrawled: 4, hasContactForm: true, hasBooking: true, publicPhones: 1,
+      pagesCrawled: 4, hasContactForm: true, hasBooking: true, publicPhones: 1, isModernPresence: true,
     });
     const strong = calculateQualificationScore(base);
     const weak = calculateQualificationScore({ ...base, phone: undefined, rating: 3.2, reviewCount: 2 });
     expect(complete.opportunity).toBe('website_present');
     expect(complete.score).toBeLessThan(50);
+    expect(strong.opportunity).toBe('new_website');
+    expect(strong.score).toBeGreaterThanOrEqual(65);
     expect(strong.score).toBeGreaterThan(weak.score);
+  });
+
+  it('does not mistake a multi-page contractor site for incomplete solely because it has no booking or form', () => {
+    const contractor = { ...base, category: 'Building contractor', website: 'https://builder.test' };
+    const result = calculateQualificationScore(contractor, {
+      pagesCrawled: 7, hasSsl: true, hasViewport: true,
+      hasContactForm: false, hasBooking: false, hasPayment: false, publicPhones: 1,
+    });
+    expect(result.opportunity).toBe('website_present');
+  });
+
+  it('holds blocked or failed crawls for review instead of treating them as broken websites', () => {
+    const candidate = { ...base, website: 'https://acme.test' };
+    for (const evidence of [{ crawlBlocked: true, pagesCrawled: 1 }, { crawlFailed: true, pagesCrawled: 0 }]) {
+      const result = calculateQualificationScore(candidate, evidence);
+      expect(result.opportunity).toBe('manual_review');
+      expect(result.score).toBeLessThan(50);
+    }
+  });
+
+  it('recognizes a functioning single-page website and flags a landing page without a conversion path', () => {
+    const candidate = { ...base, website: 'https://acme.test' };
+    const complete = calculateQualificationScore(candidate, {
+      pagesCrawled: 1, hasSsl: true, hasViewport: true, hasContactForm: true, hasBooking: true,
+    });
+    const incomplete = calculateQualificationScore(candidate, {
+      pagesCrawled: 1, hasSsl: true, hasViewport: true, hasContactForm: false, hasBooking: false,
+    });
+    expect(complete.opportunity).toBe('website_present');
+    expect(calculateQualificationScore(candidate, {
+      pagesCrawled: 1, hasSsl: true, hasViewport: true, hasContactForm: true, hasBooking: true, isOutdated: true,
+    }).opportunity).toBe('website_present');
+    expect(incomplete.opportunity).toBe('website_improvement');
+  });
+
+  it('qualifies low-score websites with missing SSL and viewport, but disqualifies modern sites', () => {
+    const lowScore = calculateQualificationScore({ ...base, website: 'http://oldacme.test' }, {
+      pagesCrawled: 1, hasSsl: false, hasViewport: false, hasContactForm: false, hasBooking: false,
+    });
+    const modernSite = calculateQualificationScore({ ...base, website: 'https://modernacme.test' }, {
+      pagesCrawled: 5, hasSsl: true, hasViewport: true, isModernPresence: true, technologies: ['Next.js', 'Tailwind'],
+    });
+    expect(lowScore.opportunity).toBe('website_improvement');
+    expect(lowScore.score).toBeGreaterThanOrEqual(60);
+    expect(modernSite.opportunity).toBe('website_present');
+    expect(modernSite.score).toBeLessThan(50);
   });
 });
 

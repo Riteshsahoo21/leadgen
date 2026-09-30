@@ -16,11 +16,12 @@ export async function databaseHealth() {
 }
 
 export async function createRun(input: CreateRunInput) {
+  const maxDiscovery = input.maxDiscovery ?? Math.max(input.targetCount * 2, 1000);
   const result = await pool.query(
-    `INSERT INTO discovery_runs (name, country, cities, business_types, target_count, provider_mode)
-     VALUES ($1, $2, $3, $4, $5, $6)
+    `INSERT INTO discovery_runs (name, country, cities, business_types, target_count, provider_mode, max_discovery)
+     VALUES ($1, $2, $3, $4, $5, $6, $7)
      RETURNING *`,
-    [input.name, input.country, input.cities, input.businessTypes, input.targetCount, config.PROVIDER_MODE],
+    [input.name, input.country, input.cities, input.businessTypes, input.targetCount, config.PROVIDER_MODE, maxDiscovery],
   );
   return result.rows[0];
 }
@@ -211,8 +212,8 @@ export async function saveQualification(companyId: string, value: {
   qualified: boolean; score: number; opportunity: string; painPoints: string[];
   recommendedRole: string; rationale?: string; model?: string; scoreBreakdown?: Record<string, unknown>;
   aiStatus?: string;
-}) {
-  await pool.query(
+}, client: pg.Pool | pg.PoolClient = pool) {
+  await client.query(
     `INSERT INTO qualifications
        (company_id,qualified,score,opportunity,pain_points,recommended_role,rationale,model,score_breakdown,ai_status)
      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
@@ -223,6 +224,49 @@ export async function saveQualification(companyId: string, value: {
     [companyId, value.qualified, value.score, value.opportunity, value.painPoints,
       value.recommendedRole, value.rationale ?? null, value.model ?? null, value.scoreBreakdown ?? {}, value.aiStatus ?? 'not_requested'],
   );
+}
+
+export async function saveQualificationWithinQuota(
+  companyId: string,
+  runId: string,
+  value: Parameters<typeof saveQualification>[1],
+) {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    // Lock the run while reserving a slot, so parallel qualification workers
+    // cannot both claim the final place in either part of the 60:40 target.
+    const run = await client.query<{ target_count: number }>(
+      'SELECT target_count FROM discovery_runs WHERE id=$1 FOR UPDATE', [runId],
+    );
+    if (!run.rows[0]) throw new Error('Discovery run no longer exists');
+    const target = Number(run.rows[0].target_count);
+    const noWebsiteTarget = Math.ceil(target * 0.6);
+    const incompleteTarget = target - noWebsiteTarget;
+    const counts = await client.query<{ no_website: string; incomplete: string }>(
+      `SELECT
+        count(*) FILTER (WHERE q.qualified AND q.opportunity='new_website') AS no_website,
+        count(*) FILTER (WHERE q.qualified AND q.opportunity='website_improvement') AS incomplete
+       FROM qualifications q JOIN companies c ON c.id=q.company_id WHERE c.run_id=$1 AND q.company_id<>$2`,
+      [runId, companyId],
+    );
+    const noWebsiteCount = Number(counts.rows[0]?.no_website ?? 0);
+    const incompleteCount = Number(counts.rows[0]?.incomplete ?? 0);
+    const quotaFilled = value.opportunity === 'new_website'
+      ? noWebsiteCount >= noWebsiteTarget
+      : value.opportunity === 'website_improvement' && incompleteCount >= incompleteTarget;
+    const saved = quotaFilled && value.qualified
+      ? { ...value, qualified: false, rationale: `The ${value.opportunity === 'new_website' ? 'no-website' : 'incomplete-website'} target is full for this run.` }
+      : value;
+    await saveQualification(companyId, saved, client);
+    await client.query('COMMIT');
+    return saved;
+  } catch (error) {
+    await client.query('ROLLBACK');
+    throw error;
+  } finally {
+    client.release();
+  }
 }
 
 export async function saveContact(companyId: string, contact: { fullName: string; role?: string | undefined; sourceUrl?: string | undefined; confidence: number }) {
@@ -270,6 +314,8 @@ export async function refreshRunStats(runId: string) {
        'ai_pending', (SELECT count(*) FROM companies c JOIN qualifications q ON q.company_id=c.id WHERE c.run_id=r.id AND q.ai_status='pending'),
        'ai_explained', (SELECT count(*) FROM companies c JOIN qualifications q ON q.company_id=c.id WHERE c.run_id=r.id AND q.ai_status='completed'),
        'qualified', (SELECT count(*) FROM companies c JOIN qualifications q ON q.company_id=c.id WHERE c.run_id=r.id AND q.qualified),
+       'no_website', (SELECT count(*) FROM companies c JOIN qualifications q ON q.company_id=c.id WHERE c.run_id=r.id AND q.qualified AND q.opportunity='new_website'),
+       'incomplete_website', (SELECT count(*) FROM companies c JOIN qualifications q ON q.company_id=c.id WHERE c.run_id=r.id AND q.qualified AND q.opportunity='website_improvement'),
        'contacts', (SELECT count(DISTINCT x.company_id) FROM contacts x JOIN companies c ON c.id=x.company_id WHERE c.run_id=r.id),
        'verified', (SELECT count(DISTINCT e.company_id) FROM contact_emails e JOIN companies c ON c.id=e.company_id WHERE c.run_id=r.id AND e.verification_status='valid'),
        'pending', (SELECT count(*) FROM companies c WHERE c.run_id=r.id AND NOT (c.status = ANY($2::text[]))),
@@ -318,8 +364,17 @@ export async function recentLeads(limit = 20) {
      FROM companies c
      LEFT JOIN qualifications q ON q.company_id=c.id
      LEFT JOIN LATERAL (SELECT * FROM contacts WHERE company_id=c.id ORDER BY confidence DESC LIMIT 1) x ON true
-     LEFT JOIN LATERAL (SELECT * FROM contact_emails WHERE company_id=c.id ORDER BY confidence DESC LIMIT 1) e ON true
-     ORDER BY c.updated_at DESC LIMIT $1`,
+     LEFT JOIN LATERAL (
+       SELECT * FROM contact_emails
+       WHERE company_id=c.id
+       ORDER BY
+         (c.domain IS NOT NULL AND email LIKE '%@' || c.domain) DESC,
+         (email NOT LIKE 'info@%' AND email NOT LIKE 'contact@%' AND email NOT LIKE 'admin@%' AND email NOT LIKE 'sales@%' AND email NOT LIKE 'support@%' AND email NOT LIKE 'enquiries@%') DESC,
+         (split_part(email, '@', 1) LIKE '%.%') DESC,
+         confidence DESC
+       LIMIT 1
+     ) e ON true
+     ORDER BY (q.qualified IS TRUE) DESC, (e.email IS NOT NULL) DESC, c.updated_at DESC LIMIT $1`,
     [limit],
   );
   return result.rows;
@@ -356,9 +411,18 @@ export async function listBusinesses(input: { search?: string | undefined; statu
        FROM companies c
        LEFT JOIN qualifications q ON q.company_id=c.id
        LEFT JOIN LATERAL (SELECT * FROM contacts WHERE company_id=c.id ORDER BY confidence DESC LIMIT 1) x ON true
-       LEFT JOIN LATERAL (SELECT * FROM contact_emails WHERE company_id=c.id ORDER BY confidence DESC LIMIT 1) e ON true
+       LEFT JOIN LATERAL (
+         SELECT * FROM contact_emails
+         WHERE company_id=c.id
+         ORDER BY
+           (c.domain IS NOT NULL AND email LIKE '%@' || c.domain) DESC,
+           (email NOT LIKE 'info@%' AND email NOT LIKE 'contact@%' AND email NOT LIKE 'admin@%' AND email NOT LIKE 'sales@%' AND email NOT LIKE 'support@%' AND email NOT LIKE 'enquiries@%') DESC,
+           (split_part(email, '@', 1) LIKE '%.%') DESC,
+           confidence DESC
+         LIMIT 1
+       ) e ON true
        ${where}
-       ORDER BY c.updated_at DESC LIMIT $3 OFFSET $4`,
+       ORDER BY (q.qualified IS TRUE) DESC, (e.email IS NOT NULL) DESC, c.updated_at DESC LIMIT $3 OFFSET $4`,
       [search, status, limit, offset],
     ),
     pool.query<{ count: number }>(`SELECT count(*)::int AS count FROM companies c ${where}`, [search, status]),
@@ -372,7 +436,15 @@ export async function getBusinessDetail(id: string) {
        row_to_json(q) AS qualification,
        row_to_json(w) AS website_evidence,
        COALESCE((SELECT jsonb_agg(x ORDER BY x.confidence DESC) FROM contacts x WHERE x.company_id=c.id), '[]'::jsonb) AS contacts,
-       COALESCE((SELECT jsonb_agg(e ORDER BY e.confidence DESC) FROM contact_emails e WHERE e.company_id=c.id), '[]'::jsonb) AS emails,
+       COALESCE((
+         SELECT jsonb_agg(e ORDER BY
+           (c.domain IS NOT NULL AND e.email LIKE '%@' || c.domain) DESC,
+           (e.email NOT LIKE 'info@%' AND e.email NOT LIKE 'contact@%' AND e.email NOT LIKE 'admin@%' AND e.email NOT LIKE 'sales@%' AND e.email NOT LIKE 'support@%' AND e.email NOT LIKE 'enquiries@%') DESC,
+           (split_part(e.email, '@', 1) LIKE '%.%') DESC,
+           e.confidence DESC
+         )
+         FROM contact_emails e WHERE e.company_id=c.id
+       ), '[]'::jsonb) AS emails,
        COALESCE((SELECT jsonb_agg(m ORDER BY m.created_at DESC) FROM messages m WHERE m.company_id=c.id), '[]'::jsonb) AS messages
      FROM companies c
      LEFT JOIN qualifications q ON q.company_id=c.id

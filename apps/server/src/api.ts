@@ -46,6 +46,12 @@ app.get('/api/config', async () => ({
 }));
 
 app.get('/api/overview', async () => {
+  const activeRuns = await pool.query<{ id: string }>(
+    "SELECT id FROM discovery_runs WHERE status IN ('queued', 'running')"
+  );
+  for (const r of activeRuns.rows) {
+    await refreshRunStats(r.id);
+  }
   const [overview, queues, runs, leads, events] = await Promise.all([
     dashboardOverview(), queueSnapshot(), listRuns(8), recentLeads(12), recentEvents(16),
   ]);
@@ -98,7 +104,7 @@ app.post('/api/research/backfill', async (request, reply) => {
   if (!parsed.success) return reply.code(400).send({ error: 'Invalid backfill request', issues: parsed.error.issues });
   const result = await pool.query(
     `SELECT c.id,c.run_id FROM companies c
-     WHERE EXISTS (SELECT 1 FROM discovery_runs r WHERE r.id=c.run_id AND r.status IN ('running','completed'))
+     WHERE EXISTS (SELECT 1 FROM discovery_runs r WHERE r.id=c.run_id AND r.status IN ('running','completed','failed','paused'))
        AND c.status NOT IN ('discovered','crawl_queued','qualify_queued','research_queued','enrich_queued','campaign_queued','cancelled')
        AND NOT EXISTS (SELECT 1 FROM contact_emails e WHERE e.company_id=c.id)
      ORDER BY c.updated_at DESC LIMIT $1`, [parsed.data.limit],
@@ -134,13 +140,17 @@ app.get('/api/qualifications', async (request, reply) => {
   const parsed = listQuerySchema.safeParse(request.query);
   if (!parsed.success) return reply.code(400).send({ error: 'Invalid query', issues: parsed.error.issues });
   const qualified = parsed.data.qualified === undefined ? undefined : parsed.data.qualified === 'true';
-  const [qualifications, summary] = await Promise.all([
+  const [qualifications, summary, pending] = await Promise.all([
     listQualifications({ qualified, opportunity: parsed.data.opportunity, limit: parsed.data.limit, offset: parsed.data.offset }),
     qualificationSummary(),
+    pool.query(`SELECT c.id,c.name,c.category,c.city,c.country,c.website,c.status,c.created_at
+      FROM companies c LEFT JOIN qualifications q ON q.company_id=c.id
+      WHERE q.company_id IS NULL AND c.status NOT IN ('filtered_out','cancelled')
+      ORDER BY c.created_at DESC LIMIT 12`),
   ]);
   const total = parsed.data.opportunity ? Number(summary[parsed.data.opportunity] ?? 0)
     : qualified === undefined ? summary.evaluated : qualified ? summary.qualified : summary.not_qualified;
-  return { qualifications, summary, total };
+  return { qualifications, summary, total, recentlyDiscovered: pending.rows };
 });
 
 app.get('/api/messages', async (request, reply) => {
@@ -158,16 +168,36 @@ app.get('/api/events', async (request, reply) => {
 app.get<{ Params: { id: string } }>('/api/runs/:id', async (request, reply) => {
   const parsed = listQuerySchema.safeParse(request.query);
   if (!parsed.success) return reply.code(400).send({ error: 'Invalid pagination' });
-  const run = await getRun(request.params.id);
+  let run = await getRun(request.params.id);
   if (!run) return reply.code(404).send({ error: 'Run not found' });
+  if (['running', 'queued'].includes(run.status)) {
+    await refreshRunStats(run.id);
+    run = (await getRun(run.id)) ?? run;
+  }
   const companies = await pool.query(
-    `SELECT c.*,q.score AS qualification_score,q.opportunity,q.score_breakdown,
-       row_number() OVER (ORDER BY q.score DESC NULLS LAST,c.review_count DESC,c.name)::int AS run_rank,
+    `SELECT c.*,q.qualified,q.score AS qualification_score,q.opportunity,q.pain_points,q.score_breakdown,
+       x.full_name,x.role,e.email,e.verification_status,
+       row_number() OVER (ORDER BY (q.qualified IS TRUE) DESC, (e.email IS NOT NULL) DESC, c.updated_at DESC, q.score DESC NULLS LAST, c.id)::int AS run_rank,
        count(*) OVER ()::int AS run_total,
-       CEIL(100.0 * row_number() OVER (ORDER BY q.score DESC NULLS LAST,c.review_count DESC,c.name)
+       CEIL(100.0 * row_number() OVER (ORDER BY (q.qualified IS TRUE) DESC, (e.email IS NOT NULL) DESC, c.updated_at DESC, q.score DESC NULLS LAST, c.id)
          / GREATEST(count(*) OVER (),1))::int AS top_percent
-     FROM companies c LEFT JOIN qualifications q ON q.company_id=c.id
-     WHERE c.run_id=$1 ORDER BY q.score DESC NULLS LAST,c.review_count DESC,c.name,c.id LIMIT $2 OFFSET $3`, [run.id, parsed.data.limit ?? 100, parsed.data.offset ?? 0],
+     FROM companies c
+     LEFT JOIN qualifications q ON q.company_id=c.id
+     LEFT JOIN LATERAL (SELECT * FROM contacts WHERE company_id=c.id ORDER BY confidence DESC LIMIT 1) x ON true
+     LEFT JOIN LATERAL (
+       SELECT * FROM contact_emails
+       WHERE company_id=c.id
+       ORDER BY
+         (c.domain IS NOT NULL AND email LIKE '%@' || c.domain) DESC,
+         (email NOT LIKE 'info@%' AND email NOT LIKE 'contact@%' AND email NOT LIKE 'admin@%' AND email NOT LIKE 'sales@%' AND email NOT LIKE 'support@%' AND email NOT LIKE 'enquiries@%') DESC,
+         (split_part(email, '@', 1) LIKE '%.%') DESC,
+         confidence DESC
+       LIMIT 1
+     ) e ON true
+     WHERE c.run_id=$1
+     ORDER BY (q.qualified IS TRUE) DESC, (e.email IS NOT NULL) DESC, c.updated_at DESC, q.score DESC NULLS LAST, c.id
+     LIMIT $2 OFFSET $3`,
+    [run.id, parsed.data.limit ?? 100, parsed.data.offset ?? 0],
   );
   return { run, companies: companies.rows, total: companies.rows[0]?.run_total ?? Number(run.stats?.discovered ?? 0) };
 });
@@ -209,10 +239,10 @@ app.post<{ Params: { id: string } }>('/api/runs/:id/pause', async (request, repl
 app.post<{ Params: { id: string } }>('/api/runs/:id/resume', async (request, reply) => {
   const run = await getRun(request.params.id);
   if (!run) return reply.code(404).send({ error: 'Run not found' });
-  if (run.status !== 'paused') return reply.code(409).send({ error: `Cannot resume a ${run.status} run` });
+  if (!['paused', 'failed'].includes(run.status)) return reply.code(409).send({ error: `Cannot resume a ${run.status} run` });
   await setRunStatus(run.id, 'running');
   await reconcileRun(run.id);
-  await logEvent(run.id, 'resumed', 'Pipeline resumed from its saved checkpoint. Paused jobs continue within 30 seconds.');
+  await logEvent(run.id, 'resumed', 'Pipeline resumed from its saved checkpoint. Paused and pending jobs continue.');
   return { status: 'running' };
 });
 

@@ -1,5 +1,7 @@
 export type RunStats = {
   ai_pending?: number;
+  no_website?: number;
+  incomplete_website?: number;
   ai_explained?: number;
   target?: number;
   discovered: number;

@@ -33,6 +33,7 @@ const envSchema = z.object({
   POSTA_API_KEY: z.string().default(''),
   POSTA_WEBHOOK_SECRET: z.string().min(12).default('local-webhook-secret'),
   POSTA_FROM: z.string().default('hello@example.com'),
+  ENABLE_AI: booleanFromString.default(false),
   ENABLE_EMAIL_SENDING: booleanFromString.default(false),
   DAILY_SEND_LIMIT: z.coerce.number().int().min(0).max(10000).default(100),
 });

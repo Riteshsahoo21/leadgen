@@ -1,18 +1,30 @@
+import fs from 'node:fs';
 import dns from 'node:dns/promises';
+import nodeDns from 'node:dns';
 import { load } from 'cheerio';
 import { parse } from 'csv-parse/sync';
+import { CheerioCrawler, PlaywrightCrawler, Configuration, LogLevel, log as crawleeLog } from 'crawlee';
 import { config } from './config.js';
 import { calculateQualificationScore, normalizeDomain, type BusinessCandidate, type CreateRunInput } from './domain.js';
+
+crawleeLog.setLevel(LogLevel.OFF);
+
+try {
+  const currentServers = nodeDns.getServers();
+  if (currentServers.length === 0 || (currentServers.length === 1 && currentServers[0] === '127.0.0.1')) {
+    nodeDns.setServers(['1.1.1.1', '8.8.8.8']);
+  }
+} catch { /* ignore DNS server override error */ }
 
 const serviceWords = ['Studio', 'Works', 'Collective', 'Partners', 'Solutions', 'House', 'Company'];
 
 export function safeBusinesses(input: CreateRunInput): BusinessCandidate[] {
   const combinations = input.cities.flatMap((city) => input.businessTypes.map((businessType) => ({ city, businessType })));
-  const target = Math.min(input.targetCount, config.MAX_DISCOVERY_RESULTS);
+  const target = Math.min(input.maxDiscovery ?? input.targetCount, config.MAX_DISCOVERY_RESULTS);
   return Array.from({ length: target }, (_, index) => {
     const combination = combinations[index % combinations.length]!;
     const serial = index + 1;
-    const slug = `${combination.businessType}-${combination.city}-${serial}`.toLowerCase().replace(/[^a-z0-9]+/g, '-');
+    const slug = `${input.name}-${combination.businessType}-${combination.city}-${serial}`.toLowerCase().replace(/[^a-z0-9]+/g, '-');
     const hasWebsite = index % 4 !== 0;
     return {
       sourceId: `demo-${slug}`,
@@ -36,11 +48,12 @@ export async function discoverBusinesses(
   shouldStop?: () => Promise<boolean>,
   checkpoint?: { jobId?: string; keywords: string[]; saveJob: (id: string) => Promise<void> },
 ): Promise<BusinessCandidate[]> {
-  if (config.PROVIDER_MODE === 'safe') return safeBusinesses(input);
+  if (config.PROVIDER_MODE === 'safe') return safeBusinesses({ ...input, name: checkpoint?.keywords[0] ?? input.name });
   if (await shouldStop?.()) return [];
 
+  const scrapePool = input.maxDiscovery ? Number(input.maxDiscovery) : Math.max(input.targetCount * 2, 50);
   const keywords = checkpoint?.keywords ?? buildDiscoveryKeywords(input);
-  const depth = mapsDepthFor(input.targetCount, keywords.length);
+  const depth = mapsDepthFor(scrapePool, keywords.length);
   let jobId = checkpoint?.jobId;
   if (!jobId) {
   const response = await fetch(`${config.GMAPS_API_URL}/api/v1/jobs`, {
@@ -51,39 +64,57 @@ export async function discoverBusinesses(
       keywords,
       lang: 'en',
       depth,
-      email: true,
-      max_time: 300,
-      max_results: Math.min(input.targetCount, config.MAX_DISCOVERY_RESULTS),
+      email: false,
+      max_time: 60,
+      max_results: Math.min(scrapePool, config.MAX_DISCOVERY_RESULTS),
     }),
     signal: AbortSignal.timeout(30_000),
   });
   if (!response.ok) throw new Error(`Maps service rejected the job (${response.status}): ${await response.text()}`);
   const payload = await response.json() as Record<string, any>;
   const immediateResults = payload.results ?? payload.Results;
-  if (Array.isArray(immediateResults)) return uniqueBusinessCandidates(immediateResults.map(mapMapsResult), input.targetCount);
+  if (Array.isArray(immediateResults)) return uniqueBusinessCandidates(immediateResults.map(mapMapsResult), scrapePool);
   jobId = String(payload.id ?? payload.ID ?? payload.job_id ?? payload.job?.id ?? '');
   if (!jobId) throw new Error('Maps service returned neither results nor a job ID');
   await checkpoint?.saveJob(jobId);
   }
   for (let attempt = 0; attempt < 180; attempt += 1) {
     if (await shouldStop?.()) return [];
-    await delay(10_000);
+    await delay(attempt === 0 ? 2_000 : 5_000);
     if (await shouldStop?.()) return [];
-    const statusResponse = await fetch(`${config.GMAPS_API_URL}/api/v1/jobs/${encodeURIComponent(jobId)}`, { signal: AbortSignal.timeout(15_000) });
-    if (!statusResponse.ok) throw new Error(`Maps job status failed (${statusResponse.status})`);
+    let statusResponse: Response;
+    try {
+      statusResponse = await fetch(`${config.GMAPS_API_URL}/api/v1/jobs/${encodeURIComponent(jobId)}`, { signal: AbortSignal.timeout(60_000) });
+    } catch (pollErr) {
+      console.warn(`[discoverBusinesses] Status poll attempt ${attempt + 1} timed out or failed, will retry:`, pollErr instanceof Error ? pollErr.message : String(pollErr));
+      continue;
+    }
+    if (!statusResponse.ok) {
+      console.warn(`[discoverBusinesses] Status poll returned HTTP ${statusResponse.status}, will retry`);
+      continue;
+    }
     const statusPayload = await statusResponse.json() as Record<string, any>;
     const statusResults = statusPayload.results ?? statusPayload.Results;
-    if (Array.isArray(statusResults)) return uniqueBusinessCandidates(statusResults.map(mapMapsResult), input.targetCount);
+    if (Array.isArray(statusResults)) return uniqueBusinessCandidates(statusResults.map(mapMapsResult), scrapePool);
     const status = String(statusPayload.status ?? statusPayload.Status ?? statusPayload.state ?? statusPayload.State ?? '').toLowerCase();
     if (['failed', 'error', 'cancelled'].includes(status)) throw new Error(`Maps job ${jobId} ${status}: ${statusPayload.error ?? ''}`);
     if (['completed', 'complete', 'done', 'success', 'succeeded', 'ok'].includes(status)) {
-      const download = await fetch(`${config.GMAPS_API_URL}/api/v1/jobs/${encodeURIComponent(jobId)}/download`, { signal: AbortSignal.timeout(30_000) });
-      if (!download.ok) throw new Error(`Maps result download failed (${download.status})`);
+      let download: Response | undefined;
+      for (let dlAttempt = 0; dlAttempt < 3; dlAttempt += 1) {
+        try {
+          download = await fetch(`${config.GMAPS_API_URL}/api/v1/jobs/${encodeURIComponent(jobId)}/download`, { signal: AbortSignal.timeout(60_000) });
+          if (download.ok) break;
+        } catch (dlErr) {
+          console.warn(`[discoverBusinesses] Download attempt ${dlAttempt + 1} failed:`, dlErr instanceof Error ? dlErr.message : String(dlErr));
+          await delay(3_000);
+        }
+      }
+      if (!download || !download.ok) throw new Error(`Maps result download failed (${download?.status ?? 'network error'})`);
       const rows = parse(await download.text(), { columns: true, skip_empty_lines: true, relax_column_count: true }) as unknown[];
-      return uniqueBusinessCandidates(rows.map(mapMapsResult), input.targetCount);
+      return uniqueBusinessCandidates(rows.map(mapMapsResult), scrapePool);
     }
   }
-  throw new Error(`Maps job ${jobId} did not complete within 30 minutes`);
+  throw new Error(`Maps job ${jobId} did not complete within the polling window`);
 }
 
 export function mapsDepthFor(targetCount: number, keywordCount: number) {
@@ -93,10 +124,13 @@ export function mapsDepthFor(targetCount: number, keywordCount: number) {
 export function buildDiscoveryKeywords(input: CreateRunInput) {
   // Each Maps query has finite inventory. Expand large targets across geographic
   // sections and search intents, while keeping one bounded upstream job.
-  const desired = Math.max(
-    input.cities.length * input.businessTypes.length,
-    Math.min(240, Math.ceil(input.targetCount / 40)),
+  const poolLimit = input.maxDiscovery ? Number(input.maxDiscovery) : Math.max(input.targetCount * 2, 50);
+  const neededBatches = Math.max(
+    input.cities.length * input.businessTypes.length * 6,
+    Math.ceil(poolLimit / 12),
   );
+  const desired = Math.min(300, Math.max(neededBatches, 5));
+
   const variants = [
     (type: string, city: string) => `${type} in ${city}, ${input.country}`,
     (type: string, city: string) => `${type} near ${city}, ${input.country}`,
@@ -104,14 +138,35 @@ export function buildDiscoveryKeywords(input: CreateRunInput) {
     (type: string, city: string) => `top rated ${type} in ${city}, ${input.country}`,
     (type: string, city: string) => `local ${type} in ${city}, ${input.country}`,
     ...['central', 'north', 'south', 'east', 'west', 'northeast', 'northwest', 'southeast', 'southwest',
-      'downtown', 'old town', 'suburbs', 'business district', 'industrial area', 'near airport', 'near railway station']
+      'downtown', 'old town', 'suburbs', 'business district', 'industrial area', 'near airport', 'near railway station',
+      'market', 'main road', 'city center', 'phase 1', 'phase 2']
       .map((area) => (type: string, city: string) => `${type} in ${area} ${city}, ${input.country}`),
   ];
   const keywords: string[] = [];
+  for (const city of input.cities) for (const type of input.businessTypes) {
+    if (!/\bconstruction\b/i.test(type)) continue;
+    for (const specialty of ['construction companies', 'building contractors', 'civil contractors',
+      'residential builders', 'construction contractors', 'home builders']) {
+      keywords.push(`${specialty} in ${city}, ${input.country}`);
+    }
+  }
   for (const variant of variants) {
     for (const city of input.cities) {
       for (const type of input.businessTypes) {
         keywords.push(variant(type, city));
+        if (keywords.length >= desired) return keywords;
+      }
+    }
+  }
+  // A single city and category still needs enough independent searches to
+  // reach a qualified target larger than the first few Maps result pages.
+  const areaTerms = ['central', 'north', 'south', 'east', 'west', 'downtown', 'old town',
+    'suburbs', 'business district', 'industrial area', 'market', 'city center'];
+  for (const area of areaTerms) {
+    for (const intent of ['best', 'top rated', 'local', 'nearby', 'trusted', 'affordable']) {
+      for (const city of input.cities) for (const type of input.businessTypes) {
+        const keyword = `${intent} ${type} in ${area} ${city}, ${input.country}`;
+        if (!keywords.includes(keyword)) keywords.push(keyword);
         if (keywords.length >= desired) return keywords;
       }
     }
@@ -137,6 +192,12 @@ function uniqueBusinessCandidates(candidates: BusinessCandidate[], limit: number
 function mapMapsResult(item: unknown): BusinessCandidate {
   const row = item as Record<string, unknown>;
   const owner = parseOwner(row.owner);
+  const emails = [
+    ...parseStringList(row.emails),
+    ...parseStringList(row.email),
+    ...parseStringList(row.Email),
+    ...parseStringList(row.Emails),
+  ];
   return {
     sourceId: stringValue(row.place_id ?? row.cid),
     name: stringValue(row.title ?? row.name) || 'Unknown business',
@@ -146,7 +207,7 @@ function mapMapsResult(item: unknown): BusinessCandidate {
     phone: stringValue(row.phone), website: stringValue(row.web_site ?? row.website),
     rating: numberValue(row.review_rating ?? row.rating), reviewCount: numberValue(row.reviews ?? row.review_count),
     latitude: numberValue(row.latitude), longitude: numberValue(row.longitude),
-    publicEmails: parseStringList(row.emails), owner, raw: row,
+    publicEmails: [...new Set(emails.map((e) => e.trim().toLowerCase().replace(/^mailto:/, '').split('?')[0]).filter((e): e is string => Boolean(e)))], owner, raw: row,
   };
 }
 
@@ -164,6 +225,7 @@ export type WebsiteEvidence = {
   title: string; description: string; about: string; services: string[]; emails: string[]; phones: string[];
   socialLinks: string[]; technologies: string[]; hasContactForm: boolean; hasBooking: boolean;
   hasPayment: boolean; pagesCrawled: number; usedBrowser: boolean; textSample: string;
+  hasViewport?: boolean; hasSsl?: boolean; isOutdated?: boolean; isModernPresence?: boolean; crawlBlocked?: boolean; siteIdentityMismatch?: boolean;
   contactSources: ContactEvidenceSource[];
   capabilities: Record<'contactForm' | 'booking' | 'onlinePurchase', CapabilitySignal>;
   pages: Array<{ url: string; title: string }>;
@@ -180,6 +242,7 @@ export async function crawlWebsite(candidate: BusinessCandidate): Promise<Websit
       socialLinks: [], technologies: ['Demo CMS'], hasContactForm: seed % 3 !== 0,
       hasBooking: seed % 4 === 0, hasPayment: seed % 5 === 0, pagesCrawled: 3,
       usedBrowser: false, textSample: `${candidate.name} services contact about`,
+      hasViewport: true, hasSsl: true, isOutdated: false, isModernPresence: seed % 4 === 0,
       contactSources: [
         ...(candidate.publicEmails ?? []).map((value) => ({ kind: 'email' as const, value, sourceType: 'google_maps' })),
         ...(candidate.phone ? [{ kind: 'phone' as const, value: candidate.phone, sourceType: 'google_maps' }] : []),
@@ -195,72 +258,117 @@ export async function crawlWebsite(candidate: BusinessCandidate): Promise<Websit
   if (!candidate.website) throw new Error('Cannot crawl a company without a website');
 
   const root = new URL(candidate.website.includes('://') ? candidate.website : `https://${candidate.website}`);
-  const urls = [root.toString()];
   const documents: Array<{ url: string; html: string }> = [];
-  for (let index = 0; index < urls.length && documents.length < config.MAX_PAGES_PER_SITE; index += 1) {
-    try {
-      const url = urls[index]!;
-      const response = await fetch(url, {
-        headers: { 'user-agent': 'LeadForgeResearchBot/1.0 (+business-research)' },
-        redirect: 'follow', signal: AbortSignal.timeout(10_000),
-      });
-      if (response.ok && response.headers.get('content-type')?.includes('text/html')) {
-        const html = (await response.text()).slice(0, 1_000_000);
-        const finalUrl = response.url || url;
+  const crawleeConfig = new Configuration({ persistStorage: false, purgeOnStart: true });
+
+  const runCheerioCrawl = async (startUrl: string) => {
+    const crawler = new CheerioCrawler({
+      maxRequestsPerCrawl: config.MAX_PAGES_PER_SITE,
+      maxConcurrency: 3,
+      requestHandlerTimeoutSecs: 10,
+      maxRequestRetries: 1,
+      async requestHandler({ $, request, enqueueLinks }) {
+        const html = $.html();
+        const finalUrl = request.loadedUrl || request.url;
         documents.push({ url: finalUrl, html });
-        const $ = load(html);
-        const discoveredLinks: Array<{ url: string; priority: number }> = [];
-        $('a[href]').each((_, node) => {
-          const href = $(node).attr('href');
-          const label = $(node).text();
-          const priority = pagePriority(`${href ?? ''} ${label}`);
-          if (!href || priority === 0) return;
-          try {
-            const discovered = new URL(href, finalUrl);
-            discovered.hash = ''; discovered.search = '';
-            if (sameHostname(discovered, root) && !urls.includes(discovered.toString())) discoveredLinks.push({ url: discovered.toString(), priority });
-          } catch { /* ignore malformed links */ }
+        await enqueueLinks({
+          strategy: 'same-hostname',
+          transformRequestFunction(req) {
+            try {
+              const u = new URL(req.url);
+              u.hash = '';
+              u.search = '';
+              req.url = u.toString();
+              const priority = pagePriority(req.url);
+              if (priority === 0) return false;
+              req.userData = { priority };
+              return req;
+            } catch {
+              return false;
+            }
+          },
         });
-        discoveredLinks.sort((left, right) => right.priority - left.priority).forEach((item) => {
-          if (!urls.includes(item.url)) urls.push(item.url);
-        });
-      }
-    } catch { /* one broken page must not fail the company */ }
-  }
-  let evidence = documents.length ? extractEvidence(documents, candidate) : undefined;
-  if (!evidence || evidence.textSample.length < 500) {
+      },
+      async failedRequestHandler({ request }, error) {
+        // Individual subpage failures should not abort the site crawl
+      },
+    }, crawleeConfig);
+
+    await crawler.run([startUrl]);
+  };
+
+  try {
+    await runCheerioCrawl(root.toString());
+  } catch { /* initial https crawl attempt failed */ }
+
+  if (documents.length === 0 && root.protocol === 'https:') {
+    const fallback = new URL(root);
+    fallback.protocol = 'http:';
     try {
-      const rendered = await renderWithBrowser(root.toString());
-      const merged = [...documents.filter((document) => document.url !== root.toString()), { url: root.toString(), html: rendered }];
-      evidence = extractEvidence(merged, candidate);
-      evidence.usedBrowser = true;
+      await runCheerioCrawl(fallback.toString());
+    } catch { /* fallback http crawl attempt failed */ }
+  }
+
+  let evidence = documents.length ? extractEvidence(documents, candidate) : undefined;
+  const hasBotProtection = evidence?.crawlBlocked === true;
+  const looksLikeJavascriptShell = documents.some(({ html }) => /<script[^>]+(?:src=|type=['"']module)/i.test(html)) && (!evidence || evidence.textSample.length < 120);
+
+  if (!hasBotProtection && (!evidence || looksLikeJavascriptShell)) {
+    try {
+      const rendered = await renderWithPlaywright(root.toString(), crawleeConfig);
+      if (rendered) {
+        const merged = [...documents.slice(1), { url: root.toString(), html: rendered }];
+        evidence = extractEvidence(merged, candidate);
+        evidence.usedBrowser = true;
+      }
     } catch (error) {
       if (!evidence) throw error;
     }
   }
+
+  if (!evidence) {
+    throw new Error('Website could not be reached, returned an empty response, or blocked automated crawling');
+  }
   return evidence;
 }
 
-let browserTail: Promise<unknown> = Promise.resolve();
+async function renderWithPlaywright(url: string, crawleeConfig: Configuration): Promise<string> {
+  let rendered = '';
+  const launchOptions: Record<string, unknown> = {
+    headless: true,
+    args: ['--no-sandbox', '--disable-dev-shm-usage', '--disable-gpu'],
+  };
+  if (config.CHROMIUM_PATH && fs.existsSync(config.CHROMIUM_PATH)) {
+    launchOptions.executablePath = config.CHROMIUM_PATH;
+  }
+  const crawler = new PlaywrightCrawler({
+    maxRequestsPerCrawl: 1,
+    requestHandlerTimeoutSecs: 20,
+    maxRequestRetries: 0,
+    launchContext: { launchOptions },
+    async requestHandler({ page }) {
+      await page.waitForLoadState('domcontentloaded');
+      await page.waitForTimeout(1000);
+      rendered = (await page.content()).slice(0, 1_000_000);
+    },
+  }, crawleeConfig);
 
-function renderWithBrowser(url: string): Promise<string> {
-  const task = browserTail.then(async () => {
-    const { chromium } = await import('playwright-core');
-    const browser = await chromium.launch({
-      headless: true, executablePath: config.CHROMIUM_PATH,
-      args: ['--no-sandbox', '--disable-dev-shm-usage', '--disable-gpu'],
-    });
-    try {
-      const page = await browser.newPage({ javaScriptEnabled: true });
-      await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 20_000 });
-      await page.waitForTimeout(1_000);
-      return (await page.content()).slice(0, 1_000_000);
-    } finally {
-      await browser.close();
+  await crawler.run([url]);
+  return rendered;
+}
+
+function decodeCfEmail(encoded: string): string | undefined {
+  if (!encoded || encoded.length < 4) return undefined;
+  try {
+    const k = parseInt(encoded.substring(0, 2), 16);
+    let email = '';
+    for (let n = 2; n < encoded.length; n += 2) {
+      email += String.fromCharCode(parseInt(encoded.substring(n, n + 2), 16) ^ k);
     }
-  });
-  browserTail = task.then(() => undefined, () => undefined);
-  return task;
+    return normalizeEmail(email);
+  } catch {
+    return undefined;
+  }
 }
 
 export function extractEvidence(documents: Array<{ url: string; html: string }>, candidate: BusinessCandidate): WebsiteEvidence {
@@ -281,17 +389,36 @@ export function extractEvidence(documents: Array<{ url: string; html: string }>,
   let title = ''; let description = ''; let hasContactForm = false; let hasBooking = false; let hasPayment = false;
   for (const document of documents) {
     const $ = load(document.html);
+    $('[data-cfemail]').each((_, node) => {
+      const decoded = decodeCfEmail($(node).attr('data-cfemail') ?? '');
+      if (decoded) { emails.add(decoded); addContactSource(contactSources, { kind: 'email', value: decoded, sourceType: 'company_website', sourceUrl: document.url }); }
+    });
+    $('a[href*="/cdn-cgi/l/email-protection"]').each((_, node) => {
+      const href = $(node).attr('href') ?? '';
+      const hash = href.split('#')[1] || href.split('email-protection/')[1];
+      if (hash) {
+        const decoded = decodeCfEmail(hash);
+        if (decoded) { emails.add(decoded); addContactSource(contactSources, { kind: 'email', value: decoded, sourceType: 'company_website', sourceUrl: document.url }); }
+      }
+    });
     extractStructuredData($, document.url, emails, phones, socialLinks, contactSources, services, capabilityHits);
     $('script,style,noscript,svg').remove();
+    $('br,p,div,li,td,th,h1,h2,h3,h4,h5,h6,section,article,a,span').after(' ');
     const text = $('body').text().replace(/\s+/g, ' ').trim();
     texts.push(text.slice(0, 12_000));
     const pageTitle = $('title').first().text().replace(/\s+/g, ' ').trim();
     pages.push({ url: document.url, title: pageTitle || new URL(document.url).pathname || candidate.name });
     title ||= pageTitle;
     description ||= $('meta[name="description"]').attr('content')?.trim() ?? '';
-    $('a[href^="mailto:"]').each((_, node) => {
-      const value = normalizeEmail($(node).attr('href')?.slice(7).split('?')[0]);
-      if (value) { emails.add(value); addContactSource(contactSources, { kind: 'email', value, sourceType: 'company_website', sourceUrl: document.url }); }
+    $('a[href]').each((_, node) => {
+      const href = $(node).attr('href')?.trim() ?? '';
+      if (/^mailto:/i.test(href)) {
+        try {
+          const raw = decodeURIComponent(href.replace(/^mailto:/i, '').split('?')[0] ?? '').trim();
+          const value = normalizeEmail(raw);
+          if (value) { emails.add(value); addContactSource(contactSources, { kind: 'email', value, sourceType: 'company_website', sourceUrl: document.url }); }
+        } catch { /* malformed mailto */ }
+      }
     });
     $('a[href^="tel:"]').each((_, node) => {
       const value = normalizePhone($(node).attr('href')?.slice(4));
@@ -325,16 +452,23 @@ export function extractEvidence(documents: Array<{ url: string; html: string }>,
       if (form.find('input[type="email"],input[type="tel"],textarea').length && /contact|message|enquir|inquiry|email|phone|support|name/i.test(formSignal)) {
         addCapabilityHit(capabilityHits.contactForm, document.url, compactSignal(formSignal, 'Contact form with public reply fields'));
       }
-      if (/book|booking|appointment|schedule|reservation|calendly/i.test(formSignal)) addCapabilityHit(capabilityHits.booking, document.url, compactSignal(formSignal, 'Booking form'));
-      if (/checkout|cart|buy now|purchase|place order|order now/i.test(formSignal)) addCapabilityHit(capabilityHits.onlinePurchase, document.url, compactSignal(formSignal, 'Purchase form'));
+      if (/book|booking|appointment|schedule|reservation|reserve|consult|calendly/i.test(formSignal)) addCapabilityHit(capabilityHits.booking, document.url, compactSignal(formSignal, 'Booking form'));
+      if (/checkout|cart|basket|buy now|purchase|place order|order now|shop/i.test(formSignal)) addCapabilityHit(capabilityHits.onlinePurchase, document.url, compactSignal(formSignal, 'Purchase form'));
     });
     $('a[href],button,[role="button"]').each((_, node) => {
       const control = $(node);
       const signal = `${control.attr('href') ?? ''} ${control.attr('aria-label') ?? ''} ${control.text()}`.replace(/\s+/g, ' ').trim();
-      if (/\b(book now|book online|schedule (?:now|online|appointment)|make an appointment|reserve now)\b/i.test(signal) || /calendly\.com|cal\.com\/|booking\.com\/.*reserve/i.test(signal)) {
+      if (
+        /\b(book\s+(?:now|online|consultation|appointment|visit|table|service|demo)|schedule\s+(?:now|online|appointment|visit)|make\s+an?\s+appointment|reserve\s+(?:now|online|table)|request\s+(?:appointment|booking|consultation|quote)|enquire\s+now|get\s+a?\s+quote)\b/i.test(signal) ||
+        /calendly\.com|cal\.com\/|booking\.com|fresha\.com|treatwell|phorest|timely|acuityscheduling|setmore|mindbody|simplybook|cliniko|zocdoc|opentable|resy|appointlet|jane\.app|vagaro|10to8\.com/i.test(signal)
+      ) {
         addCapabilityHit(capabilityHits.booking, document.url, compactSignal(signal, 'Booking control'));
       }
-      if (/\b(add to cart|buy now|checkout|purchase now|place order|order online|shop now)\b/i.test(signal) || /\/checkout(?:[/?#]|$)|\/cart(?:[/?#]|$)/i.test(signal)) {
+      if (
+        /\b(add to (?:cart|basket|quote)|buy now|checkout|purchase|place order|order online|shop now|view (?:cart|basket)|request price)\b/i.test(signal) ||
+        /\/checkout(?:[/?#]|$)|\/cart(?:[/?#]|$)|\/basket(?:[/?#]|$)/i.test(signal) ||
+        /shopify\.com|woocommerce|stripe\.com|snipcart|bigcommerce|paypal\.com\/checkout/i.test(signal)
+      ) {
         addCapabilityHit(capabilityHits.onlinePurchase, document.url, compactSignal(signal, 'Purchase control'));
       }
     });
@@ -349,11 +483,43 @@ export function extractEvidence(documents: Array<{ url: string; html: string }>,
   hasBooking = capabilityHits.booking.evidence.size > 0;
   hasPayment = capabilityHits.onlinePurchase.evidence.size > 0;
   const combined = texts.join(' ').slice(0, 24_000);
+  const rawHtmlCombined = documents.map((d) => d.html).join(' ');
+  const detectedTech = new Set<string>();
+  if (/__next|_next\/static/i.test(rawHtmlCombined)) detectedTech.add('Next.js');
+  if (/__nuxt|_nuxt\//i.test(rawHtmlCombined)) detectedTech.add('Nuxt');
+  if (/webflow\.com|data-wf-page/i.test(rawHtmlCombined)) detectedTech.add('Webflow');
+  if (/cdn\.shopify\.com|Shopify\.theme/i.test(rawHtmlCombined)) detectedTech.add('Shopify');
+  if (/static1\.squarespace\.com/i.test(rawHtmlCombined)) detectedTech.add('Squarespace');
+  if (/wixstatic\.com/i.test(rawHtmlCombined)) detectedTech.add('Wix');
+  if (/elementor-kit|wp-content/i.test(rawHtmlCombined)) detectedTech.add('WordPress');
+  if (/tailwind/i.test(rawHtmlCombined)) detectedTech.add('Tailwind');
+
+  const isProtectedOrCloudflare = documents.some((d) =>
+    /<title>\s*(?:Just a moment\.\.\.|Attention Required!\s*\|\s*Cloudflare|Security Challenge)\s*<\/title>|challenges\.cloudflare\.com|__cf_chl_|cf-browser-verification|cf-turnstile|cf_chl_opt|DDoS-GUARD/i.test(d.html)
+  );
+  if (isProtectedOrCloudflare) {
+    detectedTech.add('Cloudflare');
+    // A challenge page gives no evidence of conversion flows.
+  }
+
+  const siteIdentityMismatch = !isProtectedOrCloudflare && websiteIdentityMismatch(candidate, title, description, combined);
+  const hasViewport = documents.some((d) => /<meta[^>]+name=["']viewport["']/i.test(d.html));
+  const hasSsl = documents.some((d) => d.url.startsWith('https://'));
+  const currentYear = new Date().getFullYear();
+  const copyrightMatch = rawHtmlCombined.match(/©|&copy;|copyright\s*(?:20\d\d[-–])?(20\d\d)/i);
+  const copyrightYear = copyrightMatch ? Number(copyrightMatch[1]) : undefined;
+  const isOutdated = !isProtectedOrCloudflare && ((copyrightYear != null && copyrightYear <= currentYear - 4) ||
+    /<frameset|<marquee|<font[\s>]/i.test(rawHtmlCombined));
+
+  const isModernPresence = !isProtectedOrCloudflare && hasSsl && hasViewport && !isOutdated &&
+    documents.length >= 2 && hasContactForm && (hasBooking || hasPayment);
+
   return {
     title, description, about: combined.slice(0, 2_000), services: [...services].slice(0, 20),
     emails: [...emails].slice(0, 20), phones: [...phones].slice(0, 20),
-    socialLinks: [...socialLinks].slice(0, 20), technologies: [],
+    socialLinks: [...socialLinks].slice(0, 20), technologies: [...detectedTech],
     hasContactForm, hasBooking, hasPayment, pagesCrawled: documents.length, usedBrowser: false,
+    hasViewport, hasSsl, isOutdated, isModernPresence, crawlBlocked: isProtectedOrCloudflare, siteIdentityMismatch,
     textSample: combined.slice(0, 8_000), contactSources: [...contactSources.values()].slice(0, 60),
     capabilities: {
       contactForm: capabilitySignal(capabilityHits.contactForm, documents.length),
@@ -364,11 +530,27 @@ export function extractEvidence(documents: Array<{ url: string; html: string }>,
   };
 }
 
+export function websiteIdentityMismatch(candidate: BusinessCandidate, title: string, description: string, about: string) {
+  const generic = new Set(['the', 'and', 'pvt', 'private', 'ltd', 'limited', 'llp', 'inc',
+    'company', 'group', 'services', 'service', 'construction', 'constructions', 'builder',
+    'builders', 'engineering', 'engineers', 'infra', 'infrastructure', 'projects', 'shree',
+    'shri', 'sri', 'enterprises', 'solutions']);
+  const tokens = candidate.name.toLowerCase().replace(/[^a-z0-9]+/g, ' ').split(' ')
+    .filter((token) => token.length >= 3 && !generic.has(token));
+  if (!tokens.length) return false;
+  const site = `${normalizeDomain(candidate.website)} ${title} ${description} ${about.slice(0, 600)}`
+    .toLowerCase().replace(/[^a-z0-9]+/g, ' ');
+  const words = new Set(site.split(' '));
+  const hostname = normalizeDomain(candidate.website)?.replace(/[^a-z0-9]/g, '') ?? '';
+  return !tokens.some((token) => words.has(token) || hostname.includes(token));
+}
+
 function pagePriority(value: string) {
   if (/contact|reach-us|get-in-touch/i.test(value)) return 100;
-  if (/booking|appointment|schedule|reserve|checkout|cart|order|shop|store/i.test(value)) return 90;
+  if (/booking|appointment|schedule|reserve|checkout|cart|basket|order|shop|store/i.test(value)) return 90;
   if (/about|team|staff|leadership|founder/i.test(value)) return 75;
   if (/services?|products?|solutions?|menu|pricing|plans?/i.test(value)) return 65;
+  if (/privacy|terms|legal|impressum|imprint|policy/i.test(value)) return 60;
   if (/support|help|faq|locations?|branches/i.test(value)) return 50;
   return 0;
 }
@@ -451,6 +633,14 @@ export async function qualifyBusiness(candidate: BusinessCandidate, evidence?: R
     publicPhones: Array.isArray(evidence?.phones) ? evidence.phones.length : 0,
     socialProfiles: Array.isArray(evidence?.social_links) ? evidence.social_links.length : 0,
     crawlFailed: Boolean(storedEvidence.crawlError),
+    crawlBlocked: storedEvidence.crawlBlocked === true,
+    siteIdentityMismatch: storedEvidence.siteIdentityMismatch === true,
+    crawlError: storedEvidence.crawlError ? String(storedEvidence.crawlError) : undefined,
+    hasViewport: storedEvidence.hasViewport !== false,
+    hasSsl: storedEvidence.hasSsl !== false,
+    isOutdated: storedEvidence.isOutdated === true,
+    isModernPresence: storedEvidence.isModernPresence === true,
+    technologies: Array.isArray(storedEvidence.technologies) ? storedEvidence.technologies : [],
   });
   const qualifiedOpportunity = ['new_website', 'website_improvement'].includes(scoring.opportunity);
   const ruleResult = {
@@ -571,23 +761,23 @@ export async function researchPublicContacts(candidate: BusinessCandidate, evide
   const domain = normalizeDomain(candidate.website);
   const location = [candidate.city, candidate.country].filter(Boolean).join(' ');
   const queries = [
-    `${candidate.name} proprietor managing director partner president ${location}`,
-    `site:linkedin.com/in ${candidate.name} owner founder CEO director`,
     `"${candidate.name}" email contact ${location}`,
-    `"${candidate.name}" gmail phone ${location}`,
     `"${candidate.name}" owner founder director ${location}`,
-    `"${candidate.name}" (site:linkedin.com OR site:facebook.com OR site:instagram.com) contact ${location}`,
-    ...(domain ? [`site:${domain} email contact`] : [`"${candidate.name}" facebook instagram ${location}`]),
+    `site:linkedin.com/in "${candidate.name}"`,
+    ...(domain ? [`site:${domain} email contact`] : [`"${candidate.name}" (directory OR facebook OR yellowpages) ${location}`]),
   ];
-  const settled = await Promise.allSettled(queries.map((query) => searchPublicWeb(query)));
-  const searchResults = settled.flatMap((result) => result.status === 'fulfilled' ? result.value : []).slice(0, 60);
+  const searchResults: PublicSearchResult[] = (await Promise.all(queries.map(searchPublicWeb))).flat()
+    .filter((result) => searchResultMatchesBusiness(result, candidate));
+  const urlsToCrawl: string[] = [];
   for (const result of searchResults) {
     const sourceUrl = result.url;
+    if (sourceUrl && /\.(?:pdf|docx?|xlsx?)(?:[?#]|$)/i.test(sourceUrl)) continue;
     const text = deobfuscateContactText(`${result.title ?? ''} ${result.content ?? ''} ${sourceUrl ?? ''}`);
-    const sourceType = sourceUrl && /(?:linkedin|facebook|instagram|x\.com|twitter)\./i.test(sourceUrl) ? 'social_search' : 'public_search';
-    if (sourceUrl && sourceType === 'social_search') {
+    const isSocial = Boolean(sourceUrl && /(?:linkedin|facebook|instagram|x\.com|twitter)\./i.test(sourceUrl));
+    const sourceType = isSocial ? 'social_profile' : 'directory_listing';
+    if (sourceUrl && isSocial) {
       socialLinks.add(sourceUrl);
-      addContactSource(sources, { kind: 'social', value: sourceUrl, sourceType, sourceUrl });
+      addContactSource(sources, { kind: 'social', value: sourceUrl, sourceType: 'social_profile', sourceUrl });
     }
     for (const email of extractEmails(text)) {
       emails.add(email);
@@ -597,26 +787,64 @@ export async function researchPublicContacts(candidate: BusinessCandidate, evide
       phones.add(phone);
       addContactSource(sources, { kind: 'phone', value: phone, sourceType, ...(sourceUrl ? { sourceUrl } : {}) });
     }
+    if (sourceUrl && /^https?:\/\//i.test(sourceUrl)
+      && !/(?:google|bing|yahoo|duckduckgo|searx|yandex|baidu)\./i.test(sourceUrl)
+      && !/\.(?:pdf|docx?|xlsx?|pptx?|zip|png|jpe?g)$/i.test(sourceUrl)
+      && (!domain || !sourceUrl.toLowerCase().includes(domain))
+      && !urlsToCrawl.includes(sourceUrl)
+      && urlsToCrawl.length < 5) {
+      urlsToCrawl.push(sourceUrl);
+    }
   }
+
+  if (urlsToCrawl.length > 0) {
+    const crawledPages = await Promise.allSettled(urlsToCrawl.map((url) => crawlPublicContactPage(url)));
+    for (const res of crawledPages) {
+      if (res.status !== 'fulfilled') continue;
+      const page = res.value;
+      const isSocial = /(?:linkedin|facebook|instagram|x\.com|twitter)\./i.test(page.url);
+      const pageSourceType = isSocial ? 'social_profile' : 'directory_listing';
+      for (const email of page.emails) {
+        emails.add(email);
+        addContactSource(sources, { kind: 'email', value: email, sourceType: pageSourceType, sourceUrl: page.url });
+      }
+      for (const phone of page.phones) {
+        phones.add(phone);
+        addContactSource(sources, { kind: 'phone', value: phone, sourceType: pageSourceType, sourceUrl: page.url });
+      }
+    }
+  }
+
   return {
     emails: [...emails].slice(0, 30), phones: [...phones].slice(0, 30), socialLinks: [...socialLinks].slice(0, 30),
-    sources: [...sources.values()].slice(0, 100), searchResults,
+    sources: [...sources.values()].slice(0, 100), searchResults: searchResults.slice(0, 60),
   };
 }
 
 async function crawlPublicContactPage(url: string) {
-  if (!/^https?:\/\//i.test(url) || !/(?:linkedin|facebook|instagram|x\.com|twitter)\./i.test(url)) return { url, emails: [], phones: [] };
-  const response = await fetch(url, {
-    headers: { 'user-agent': 'Mozilla/5.0 (compatible; LeadForgePublicResearch/1.0)' },
-    redirect: 'follow', signal: AbortSignal.timeout(8_000),
-  });
-  if (!response.ok || !response.headers.get('content-type')?.includes('text/html')) return { url, emails: [], phones: [] };
-  const $ = load((await response.text()).slice(0, 500_000));
-  $('script,style,noscript,svg').remove();
-  const text = $('body').text().replace(/\s+/g, ' ').slice(0, 40_000);
-  const mailto = $('a[href^="mailto:"]').map((_, node) => $(node).attr('href')?.slice(7).split('?')[0] ?? '').get();
-  const telephone = $('a[href^="tel:"]').map((_, node) => $(node).attr('href')?.slice(4) ?? '').get();
-  return { url: response.url || url, emails: extractEmails(`${text} ${mailto.join(' ')}`), phones: extractPhones(`${text} ${telephone.join(' ')}`) };
+  if (!/^https?:\/\//i.test(url)) return { url, emails: [], phones: [] };
+  if (/(?:google|bing|yahoo|duckduckgo|searx|yandex|baidu)\./i.test(url)) return { url, emails: [], phones: [] };
+  if (/\.(?:pdf|docx?|xlsx?|pptx?|zip|rar|tar|gz|mp4|mp3|avi|png|jpe?g|gif|webp|svg)$/i.test(url)) return { url, emails: [], phones: [] };
+  try {
+    const response = await fetch(url, {
+      headers: {
+        'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
+        'accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'accept-language': 'en-ZA,en-GB;q=0.9,en;q=0.8',
+      },
+      redirect: 'follow', signal: AbortSignal.timeout(10_000),
+    });
+    if (!response.ok || !response.headers.get('content-type')?.includes('text/html')) return { url, emails: [], phones: [] };
+    const $ = load((await response.text()).slice(0, 500_000));
+    $('script,style,noscript,svg').remove();
+    $('br,p,div,li,td,th,h1,h2,h3,h4,h5,h6,section,article,a,span').after(' ');
+    const text = $('body').text().replace(/\s+/g, ' ').slice(0, 40_000);
+    const mailto = $('a[href^="mailto:"]').map((_, node) => $(node).attr('href')?.slice(7).split('?')[0] ?? '').get();
+    const telephone = $('a[href^="tel:"]').map((_, node) => $(node).attr('href')?.slice(4) ?? '').get();
+    return { url: response.url || url, emails: extractEmails(`${text} ${mailto.join(' ')}`), phones: extractPhones(`${text} ${telephone.join(' ')}`) };
+  } catch {
+    return { url, emails: [], phones: [] };
+  }
 }
 
 export async function findDecisionMaker(candidate: BusinessCandidate, role = 'Owner', suppliedResults: PublicSearchResult[] = []) {
@@ -624,7 +852,9 @@ export async function findDecisionMaker(candidate: BusinessCandidate, role = 'Ow
     const names = ['Aarav Sharma', 'Isha Patel', 'Rohan Das', 'Meera Singh', 'Arjun Rao'];
     return { fullName: names[candidate.name.length % names.length]!, role, sourceUrl: candidate.website, confidence: 76 };
   }
-  if (candidate.owner?.name) return { fullName: candidate.owner.name, role, sourceUrl: candidate.owner.sourceUrl, confidence: 82 };
+  if (candidate.owner?.name && isLikelyPersonName(candidate.owner.name, candidate.name, /owner/i)) {
+    return { fullName: candidate.owner.name, role, sourceUrl: candidate.owner.sourceUrl, confidence: 82 };
+  }
   const results = suppliedResults.length ? suppliedResults : await searchPublicWeb(`"${candidate.name}" ${role} ${candidate.city ?? ''}`);
   const result = results.find((item) => item.title && /owner|founder|director|ceo/i.test(`${item.title} ${item.content}`));
   if (!result) return undefined;
@@ -642,16 +872,20 @@ export async function findDecisionMakers(candidate: BusinessCandidate, role = 'O
     }];
   }
   const contacts: Array<{ fullName: string; role: string; sourceUrl?: string; confidence: number }> = [];
-  if (candidate.owner?.name) contacts.push({
-    fullName: candidate.owner.name, role, confidence: 88,
-    ...(candidate.owner.sourceUrl ? { sourceUrl: candidate.owner.sourceUrl } : {}),
-  });
-  const results = suppliedResults.length ? suppliedResults : await searchPublicWeb(
-    `${candidate.name} owner founder CEO director proprietor partner ${candidate.city ?? ''}`,
-  );
-  const companyTokens = candidate.name.toLowerCase().split(/[^a-z0-9]+/).filter((value) => value.length >= 4);
-  const domain = normalizeDomain(candidate.website);
   const rolePattern = /\b(co[ -]?founder|founder|owner|chief executive officer|ceo|managing director|director|proprietor|partner|president)\b/i;
+  if (candidate.owner?.name && isLikelyPersonName(candidate.owner.name, candidate.name, rolePattern)) {
+    contacts.push({
+      fullName: candidate.owner.name, role, confidence: 88,
+      ...(candidate.owner.sourceUrl ? { sourceUrl: candidate.owner.sourceUrl } : {}),
+    });
+  }
+  const results = suppliedResults.length ? suppliedResults : await searchPublicWeb(
+    `"${candidate.name}" owner founder CEO director proprietor partner ${candidate.city ?? ''}`,
+  );
+  const companyTokens = candidate.name.toLowerCase().split(/[^a-z0-9]+/).filter((value) => value.length >= 3 && !['pty','ltd','the','and'].includes(value));
+  const domain = normalizeDomain(candidate.website);
+  const beforePattern = /\b(?:co[ -]?founder|founder|owner|chief executive officer|ceo|managing director|director|proprietor|partner|president)\s*(?::|–|-|is|\b)\s*([A-Z][A-Za-z.'-]+(?:\s+[A-Z][A-Za-z.'-]+){1,3})\b/i;
+  const afterPattern = /\b([A-Z][A-Za-z.'-]+(?:\s+[A-Z][A-Za-z.'-]+){1,3})\s*(?:,|is\s+(?:the\s+)?|\s+is\s+)?\s*(?:co[ -]?founder|founder|owner|chief executive officer|ceo|managing director|director|proprietor|partner|president)\b/i;
   for (const result of results) {
     const combined = `${result.title ?? ''} ${result.content ?? ''}`;
     const roleMatch = combined.match(rolePattern);
@@ -660,8 +894,12 @@ export async function findDecisionMakers(candidate: BusinessCandidate, role = 'O
       || Boolean(domain && result.url?.toLowerCase().includes(domain));
     if (!relevant) continue;
     const titleParts = (result.title ?? '').split(/\s+(?:\||-|–|—|:)\s+/);
-    const contentName = combined.match(/\b([A-Z][A-Za-z.'-]+(?:\s+[A-Z][A-Za-z.'-]+){1,3})\s+(?:is\s+(?:the\s+)?|,\s*)?(?:co[ -]?founder|founder|owner|chief executive officer|ceo|managing director|director|proprietor|partner|president)\b/i)?.[1];
-    const rawName = contentName ?? titleParts.find((part) => isLikelyPersonName(part, candidate.name, rolePattern));
+    const titleName = titleParts.find((part) => isLikelyPersonName(part, candidate.name, rolePattern));
+    const extractedContentName = combined.match(afterPattern)?.[1]
+      ?? combined.match(beforePattern)?.[1]
+      ?? combined.match(/\b(?:officer|officers|director|directors|leadership)\s*:\s*([A-Z][A-Za-z.'-]+(?:\s+[A-Z][A-Za-z.'-]+){1,3})\b/i)?.[1];
+    const validContentName = extractedContentName && isLikelyPersonName(extractedContentName, candidate.name, rolePattern) ? extractedContentName : undefined;
+    const rawName = titleName ?? validContentName;
     if (!rawName) continue;
     const fullName = rawName.replace(rolePattern, '').replace(/\s+/g, ' ').trim().slice(0, 100);
     if (!isLikelyPersonName(fullName, candidate.name, rolePattern)) continue;
@@ -691,32 +929,59 @@ function isLikelyPersonName(value: string, companyName: string, rolePattern: Reg
   return !/\b(company|business|official|profile|linkedin|facebook|instagram|services|solutions|private|limited|ltd)\b/i.test(clean);
 }
 
+export function searchResultMatchesBusiness(result: PublicSearchResult, candidate: BusinessCandidate) {
+  const sourceDomain = normalizeDomain(result.url);
+  const businessDomain = normalizeDomain(candidate.website);
+  if (sourceDomain && businessDomain && sourceDomain === businessDomain) return true;
+  const haystack = `${result.title ?? ''} ${result.url ?? ''}`.toLowerCase()
+    .replace(/[^a-z0-9]+/g, ' ').trim();
+  const compact = haystack.replace(/\s+/g, '');
+  const fullName = candidate.name.toLowerCase().replace(/[^a-z0-9]+/g, '');
+  if (fullName.length >= 6 && compact.includes(fullName)) return true;
+  const generic = new Set(['private','limited','construction','constructions','builders','builder',
+    'engineering','engineers','services','service','company','pvt','ltd','the','and','homes','home']);
+  const distinctive = candidate.name.toLowerCase().replace(/[^a-z0-9]+/g, ' ').split(' ')
+    .filter((word) => word.length >= 3 && !generic.has(word));
+  const words = new Set(haystack.split(' '));
+  return distinctive.length > 0 &&
+    distinctive.filter((word) => words.has(word) || sourceDomain?.includes(word)).length >= Math.min(2, distinctive.length);
+}
+
 export async function enrichEmails(candidate: BusinessCandidate, fullName: string, publicSources: ContactEvidenceSource[] = [], harvested: string[] = []) {
-  const domain = normalizeDomain(candidate.website);
+  let domain = normalizeDomain(candidate.website);
+  if (!domain) {
+    for (const source of publicSources) {
+      const emailDomain = source.value.split('@')[1]?.toLowerCase();
+      if (emailDomain && !/(?:gmail|yahoo|hotmail|outlook|telkomsa|mweb|vodamail|icloud|aol|proton|zoho)\./i.test(emailDomain)) {
+        domain = emailDomain;
+        break;
+      }
+    }
+  }
   const candidates = new Map<string, ContactEvidenceSource>();
-  for (const source of publicSources.filter((item) => item.kind === 'email')) {
+  for (const source of publicSources.filter((item) => item.kind === 'email' &&
+    (!['directory_listing','social_profile'].includes(item.sourceType) ||
+      (item.sourceUrl && searchResultMatchesBusiness({ url: item.sourceUrl }, candidate))))) {
     const address = normalizeEmail(source.value);
     if (address) candidates.set(address, { ...source, value: address });
   }
-  for (const address of [...(candidate.publicEmails ?? []), ...harvested]) {
+  for (const address of [...(candidate.publicEmails ?? []), ...(publicSources.length ? [] : harvested)]) {
     const normalized = normalizeEmail(address);
     if (normalized && !candidates.has(normalized)) candidates.set(normalized, {
       kind: 'email', value: normalized, sourceType: candidate.publicEmails?.includes(address) ? 'google_maps' : 'company_website',
       ...(candidate.website ? { sourceUrl: candidate.website } : {}),
     });
   }
-  const tokens = fullName.toLowerCase().replace(/[^a-z\s]/g, '').split(/\s+/).filter(Boolean);
-  const first = tokens[0]; const last = tokens.at(-1);
-  if (domain && first && last && normalizeNameForComparison(fullName) !== normalizeNameForComparison(candidate.name)) {
-    const generated = `${first}.${last}@${domain}`;
-    if (!candidates.has(generated)) candidates.set(generated, { kind: 'email', value: generated, sourceType: 'generated_pattern' });
-  }
   const results: Array<{ address: string; status: string; method: string; confidence: number; evidence: Record<string, unknown> }> = [];
   const mxCache = new Map<string, Awaited<ReturnType<typeof dns.resolveMx>> | undefined>();
   for (const source of [...candidates.values()].slice(0, 12)) {
     const address = source.value;
-    const addressDomain = address.split('@')[1];
+    const addressDomain = address.split('@')[1]?.toLowerCase();
     if (!addressDomain) continue;
+    const isGenericWebmail = /(?:gmail|yahoo|hotmail|outlook|telkomsa|telkom|mweb|vodamail|icloud|aol|proton|zoho)\./i.test(addressDomain);
+    if (domain && addressDomain !== domain && !isGenericWebmail) {
+      continue;
+    }
     if (config.PROVIDER_MODE === 'safe') {
       results.push({ address, status: 'valid', method: 'safe_mode', confidence: 90, evidence: { ...source, public: true } });
       continue;
@@ -728,19 +993,47 @@ export async function enrichEmails(candidate: BusinessCandidate, fullName: strin
         results.push({ address, status: 'invalid', method: 'dns_mx', confidence: 95, evidence: { ...source, reason: 'No MX records' } });
         continue;
       }
-      const firstParty = ['company_website', 'google_maps'].includes(source.sourceType);
+      const isHarvested = ['company_website', 'google_maps', 'structured_data', 'directory_listing', 'public_search', 'social_profile'].includes(source.sourceType);
       const generated = source.sourceType === 'generated_pattern';
       results.push({
-        address, status: firstParty ? 'valid' : 'risky',
+        address, status: isHarvested ? 'valid' : 'risky',
         method: generated ? 'pattern_and_mx' : `${source.sourceType}_and_mx`,
-        confidence: firstParty ? 94 : generated ? 55 : 76,
+        confidence: isHarvested ? 92 : 65,
         evidence: { ...source, public: !generated, mx: mx.map((entry) => entry.exchange) },
       });
     } catch {
       results.push({ address, status: 'invalid', method: 'dns_mx', confidence: 90, evidence: { ...source, reason: 'MX lookup failed' } });
     }
   }
-  return results.sort((left, right) => right.confidence - left.confidence);
+  return results.sort((left, right) => {
+    const leftObserved = left.evidence.sourceType === 'generated_pattern' ? 0 : 1;
+    const rightObserved = right.evidence.sourceType === 'generated_pattern' ? 0 : 1;
+    if (leftObserved !== rightObserved) return rightObserved - leftObserved;
+    const leftDomain = left.address.split('@')[1]?.toLowerCase();
+    const rightDomain = right.address.split('@')[1]?.toLowerCase();
+    const ownerName = normalizeNameForComparison(fullName).split(' ').filter(Boolean);
+    const isOwnerAddress = (address: string) => {
+      if (ownerName.length < 2 || normalizeNameForComparison(fullName) === normalizeNameForComparison(candidate.name)) return 0;
+      const local = address.split('@')[0]!.replace(/[^a-z]/g, '');
+      return local.includes(ownerName[0]!) && local.includes(ownerName.at(-1)!) ? 1 : 0;
+    };
+    const leftOwner = isOwnerAddress(left.address);
+    const rightOwner = isOwnerAddress(right.address);
+    if (leftOwner !== rightOwner) return rightOwner - leftOwner;
+    const leftMatch = domain && leftDomain === domain ? 1 : 0;
+    const rightMatch = domain && rightDomain === domain ? 1 : 0;
+    if (leftMatch !== rightMatch) return rightMatch - leftMatch;
+
+    const isGenericLeft = /^(?:info|contact|sales|admin|support|hello|enquiries|office|help)@/i.test(left.address) ? 1 : 0;
+    const isGenericRight = /^(?:info|contact|sales|admin|support|hello|enquiries|office|help)@/i.test(right.address) ? 1 : 0;
+    if (isGenericLeft !== isGenericRight) return isGenericLeft - isGenericRight;
+
+    const leftHasDot = left.address.split('@')[0]?.includes('.') ? 1 : 0;
+    const rightHasDot = right.address.split('@')[0]?.includes('.') ? 1 : 0;
+    if (leftHasDot !== rightHasDot) return rightHasDot - leftHasDot;
+
+    return right.confidence - left.confidence;
+  });
 }
 
 export async function enrichEmail(candidate: BusinessCandidate, fullName: string, harvested: string[] = []) {
@@ -783,20 +1076,40 @@ async function legacyEnrichEmail(candidate: BusinessCandidate, fullName: string,
 
 export async function sendWithPosta(to: string, subject: string, body: string) {
   const response = await fetch(`${config.POSTA_URL}/api/v1/emails/send`, {
-    method: 'POST', signal: AbortSignal.timeout(30_000), headers: {
-      'content-type': 'application/json', authorization: `Bearer ${config.POSTA_API_KEY}`,
+    method: 'POST',
+    signal: AbortSignal.timeout(30_000),
+    headers: {
+      'content-type': 'application/json',
+      authorization: `Bearer ${config.POSTA_API_KEY}`,
+      'user-agent': 'LeadForge/1.0',
     },
-    body: JSON.stringify({ from: config.POSTA_FROM, to: [to], subject, html: `<p>${escapeHtml(body).replace(/\n/g, '<br>')}</p>` }),
+    body: JSON.stringify({
+      from: config.POSTA_FROM,
+      to: [to],
+      subject,
+      html: `<p>${escapeHtml(body).replace(/\n/g, '<br>')}</p>`,
+    }),
   });
   if (!response.ok) throw new Error(`Posta error ${response.status}: ${await response.text()}`);
-  return response.json() as Promise<{ id: string; status: string }>;
+  const payload = (await response.json()) as { id?: string; status?: string; data?: { id?: string; status?: string } };
+  const id = payload.data?.id ?? payload.id ?? '';
+  const status = payload.data?.status ?? payload.status ?? 'queued';
+  return { id, status };
 }
 
 async function searchPublicWeb(query: string): Promise<PublicSearchResult[]> {
-  const response = await fetch(`${config.SEARXNG_URL}/search?format=json&q=${encodeURIComponent(query)}`, { signal: AbortSignal.timeout(20_000) });
-  if (!response.ok) throw new Error(`SearXNG error ${response.status}`);
-  const data = await response.json() as { results?: PublicSearchResult[] };
-  return (data.results ?? []).slice(0, 20);
+  try {
+    const response = await fetch(`${config.SEARXNG_URL}/search?format=json&engines=bing,yahoo&q=${encodeURIComponent(query)}`, { signal: AbortSignal.timeout(20_000) });
+    if (!response.ok) {
+      console.warn(`[searchPublicWeb] SearXNG HTTP ${response.status} for query: ${query.slice(0, 60)}`);
+      return [];
+    }
+    const data = await response.json() as { results?: PublicSearchResult[] };
+    return (data.results ?? []).slice(0, 20);
+  } catch (error) {
+    console.warn(`[searchPublicWeb] SearXNG search failed for "${query.slice(0, 60)}":`, error instanceof Error ? error.message : String(error));
+    return [];
+  }
 }
 
 export function parseOwner(value: unknown): BusinessCandidate['owner'] {
@@ -826,9 +1139,16 @@ function stringArray(value: unknown): string[] {
 
 function normalizeEmail(value: unknown): string | undefined {
   if (typeof value !== 'string') return undefined;
-  const email = value.trim().toLowerCase().replace(/^mailto:/, '').split('?')[0];
-  if (!email || email.length > 254 || !/^[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}$/i.test(email)) return undefined;
-  if (/(?:example|domain|email)\.(?:com|org|net)$/.test(email.split('@')[1] ?? '')) return undefined;
+  let email = value.trim().toLowerCase().replace(/^mailto:/, '').split('?')[0]!;
+  if (!email || email.length > 254) return undefined;
+  // Clean concatenated trailing text from HTML tag stripping (e.g. .co.zamore, .comphone, .inphone)
+  email = email.replace(/(\.(?:co\.[a-z]{2}|org\.[a-z]{2}|ac\.[a-z]{2}|gov\.[a-z]{2}|[a-z]{2,8}))(phone|call|tel|fax|more|contact|click|view|here|about|email|mail|address|website|web|open|close|mon|tue|wed|thu|fri|sat|sun)\b.*$/i, '$1');
+  if (!/^[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}$/i.test(email)) return undefined;
+  const [userPart, hostPart] = email.split('@');
+  if (!userPart || !hostPart) return undefined;
+  // Filter dummy sample emails common on directory previews (e.g. prospeo, hunter, zoominfo sample placeholders)
+  if (/^(?:john|doe|john\.doe|johndoe|jane|jane\.doe|janedoe|sample|test|placeholder|yourname|user)$/i.test(userPart)) return undefined;
+  if (/(?:example|domain|email|sentry|anthropic|openai|github|wixpress|wordpress|shopify|cloudflare)\.(?:com|org|net|io|ai)$/i.test(hostPart)) return undefined;
   return email;
 }
 

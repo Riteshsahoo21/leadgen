@@ -17,7 +17,8 @@ export const createRunSchema = z.object({
   country: z.string().trim().min(2).max(80),
   cities: commaList.pipe(z.array(z.string().max(80)).max(50)),
   businessTypes: commaList.pipe(z.array(z.string().max(80)).max(50)),
-  targetCount: z.coerce.number().int().min(1).max(50000).default(5000),
+  targetCount: z.coerce.number().int().min(1).max(50000).default(500),
+  maxDiscovery: z.coerce.number().int().min(1).max(100000).optional(),
 });
 
 export type CreateRunInput = z.infer<typeof createRunSchema>;
@@ -81,6 +82,14 @@ export type QualificationEvidence = {
   publicPhones?: number;
   socialProfiles?: number;
   crawlFailed?: boolean;
+  crawlBlocked?: boolean;
+  siteIdentityMismatch?: boolean;
+  crawlError?: string | undefined;
+  hasViewport?: boolean;
+  hasSsl?: boolean;
+  isOutdated?: boolean;
+  isModernPresence?: boolean;
+  technologies?: string[];
 };
 
 export type QualificationScoreBreakdown = {
@@ -96,27 +105,60 @@ export type QualificationScoreBreakdown = {
 export function calculateQualificationScore(candidate: BusinessCandidate, evidence: QualificationEvidence = {}) {
   const pagesCrawled = Math.max(0, Number(evidence.pagesCrawled ?? 0));
   const category = `${candidate.category ?? ''} ${(candidate.categories ?? []).join(' ')}`;
-  const bookingRelevant = /dentist|clinic|doctor|salon|spa|hotel|restaurant|consult|agency|repair|service|contractor|law|account|real estate|fitness/i.test(category);
-  const commerceRelevant = /restaurant|retail|store|shop|e-?commerce|clothing|garment|food|bakery|delivery/i.test(category);
+  const bookingRelevant = /dentist|clinic|doctor|salon|spa|hotel|restaurant|repair|fitness/i.test(category);
+  const commerceRelevant = /retail|store|shop|e-?commerce|clothing|garment|delivery/i.test(category);
   const painPoints: string[] = [];
   const signals: string[] = [];
   let opportunity = 'website_present';
   let need = 0;
 
   if (!candidate.website) {
+    // 1. NO WEBSITE: Highest priority, pull them all
     opportunity = 'new_website';
-    need = 40;
-    painPoints.push('No detected website');
-    signals.push('No website creates a clear build opportunity');
-  } else if (evidence.crawlFailed || pagesCrawled === 0) {
+    need = 55;
+    painPoints.push('No website detected for this business');
+    signals.push('No website creates an urgent ground-floor website build opportunity');
+  } else if (evidence.isModernPresence) {
+    // Already has strong, modern digital presence: Disqualify
+    opportunity = 'website_present';
+    need = 0;
+    painPoints.push('Business already has an active, modern website with conversion flow');
+    signals.push('Website appears modern and functional; low priority for redesign');
+  } else if (evidence.siteIdentityMismatch || evidence.crawlBlocked || evidence.crawlFailed || pagesCrawled === 0) {
     opportunity = 'manual_review';
-    need = 12;
-    painPoints.push('Website could not be evaluated from public pages');
-    signals.push('Website evidence is incomplete, so the lead needs manual review');
+    need = 0;
+    painPoints.push(evidence.siteIdentityMismatch
+      ? 'Linked website does not appear to belong to this business'
+      : evidence.crawlBlocked
+        ? 'Website blocked automated inspection; review it manually'
+        : 'Website could not be evaluated; review it manually');
+    signals.push('No reliable website capability evidence was collected');
   } else {
+    // Evaluate low functionality / outdated signals
     const gaps: Array<{ points: number; painPoint: string; signal: string }> = [];
-    if (evidence.hasContactForm === false) gaps.push({
-      points: 16,
+    if (evidence.hasSsl === false) gaps.push({
+      points: 15,
+      painPoint: 'Website does not use SSL (insecure HTTP connection)',
+      signal: 'Insecure HTTP site risks visitor trust and search ranking',
+    });
+    if (evidence.hasViewport === false) gaps.push({
+      points: 15,
+      painPoint: 'Website lacks a responsive viewport meta tag (not mobile-friendly)',
+      signal: 'Site is not optimized for smartphone traffic',
+    });
+    if (evidence.isOutdated === true && !evidence.hasContactForm && !evidence.hasBooking && !evidence.hasPayment) gaps.push({
+      points: 12,
+      painPoint: 'Website layout, copyright, or structure appears outdated',
+      signal: 'Site appears stale and unmaintained',
+    });
+    const hasConversionPath = Boolean(evidence.hasContactForm || evidence.hasBooking || evidence.hasPayment);
+    if (pagesCrawled === 1 && !hasConversionPath) gaps.push({
+      points: 18,
+      painPoint: 'Only a landing page with no detected enquiry, booking, or purchase flow was checked',
+      signal: 'Single-page site exposes no detected conversion path',
+    });
+    if (evidence.hasContactForm === false && !evidence.hasBooking && !evidence.hasPayment && !evidence.publicEmails && !evidence.publicPhones && !candidate.phone && pagesCrawled > 1) gaps.push({
+      points: 12,
       painPoint: `No contact form detected on ${pagesCrawled} checked page${pagesCrawled === 1 ? '' : 's'}`,
       signal: 'No direct website enquiry form was detected',
     });
@@ -130,21 +172,21 @@ export function calculateQualificationScore(candidate: BusinessCandidate, eviden
       painPoint: `No online ordering or purchase flow detected on ${pagesCrawled} checked page${pagesCrawled === 1 ? '' : 's'}`,
       signal: 'A commerce-oriented business has no detected purchase flow',
     });
-    if (gaps.length) {
+
+    if (gaps.length > 0) {
       opportunity = 'website_improvement';
-      need = Math.min(40, 8 + gaps.reduce((sum, gap) => sum + gap.points, 0));
+      need = Math.min(50, 10 + gaps.reduce((sum, gap) => sum + gap.points, 0));
       painPoints.push(...gaps.map((gap) => gap.painPoint));
       signals.push(...gaps.map((gap) => gap.signal));
     } else {
-      painPoints.push('No clear website conversion gap detected on checked pages');
-      signals.push('The checked pages already expose the relevant conversion paths');
+      opportunity = 'website_present';
+      painPoints.push('Website already has active conversion paths and functional pages');
+      signals.push('Checked pages expose relevant conversion flows');
     }
   }
 
   const reviews = Math.max(0, candidate.reviewCount ?? 0);
-  // Log scaling prevents very large review counts from overwhelming every other signal.
   const reviewStrength = Math.round(14 * Math.log1p(Math.min(reviews, 2_000)) / Math.log1p(2_000));
-  // Bayesian shrinkage prevents a five-star business with only a few reviews from outranking established businesses.
   const priorRating = 3.8;
   const priorReviews = 20;
   const adjustedRating = candidate.rating == null
@@ -166,10 +208,12 @@ export function calculateQualificationScore(candidate: BusinessCandidate, eviden
 
   const evidenceQuality = Math.min(13,
     (candidate.sourceId ? 2 : 0) + (candidate.address ? 2 : 0) + Math.min(7, pagesCrawled * 2) + ((publicEmails || publicPhones) ? 2 : 0));
-  const penalty = evidence.crawlFailed ? 10 : 0;
+  const penalty = evidence.crawlFailed ? 5 : 0;
   let total = Math.round(clamp(need + businessStrength + reachability + evidenceQuality - penalty, 0, 100));
-  if (opportunity === 'website_present') total = Math.min(total, 49);
-  if (opportunity === 'manual_review') total = Math.min(total, 55);
+
+  if (opportunity === 'website_present' || opportunity === 'manual_review') total = Math.min(total, 40);
+  if (opportunity === 'new_website') total = Math.max(total, 65);
+  if (opportunity === 'website_improvement') total = Math.max(total, 60);
 
   const breakdown: QualificationScoreBreakdown = {
     need, businessStrength, reachability, evidenceQuality, penalty, total, signals: signals.slice(0, 8),

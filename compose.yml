@@ -24,10 +24,11 @@ x-server-env: &server-env
   SEARXNG_URL: http://searxng:8080
   OLLAMA_URL: http://ollama:11434
   OLLAMA_MODEL: ${OLLAMA_MODEL:-qwen3:4b}
-  POSTA_URL: http://posta:9000
+  POSTA_URL: ${POSTA_URL:-http://posta:9000}
   POSTA_API_KEY: ${POSTA_API_KEY:-}
   POSTA_WEBHOOK_SECRET: ${POSTA_WEBHOOK_SECRET:?Set POSTA_WEBHOOK_SECRET}
   POSTA_FROM: ${POSTA_FROM:-hello@example.com}
+  ENABLE_AI: ${ENABLE_AI:-false}
   ENABLE_EMAIL_SENDING: ${ENABLE_EMAIL_SENDING:-false}
   DAILY_SEND_LIMIT: ${DAILY_SEND_LIMIT:-100}
 
@@ -178,6 +179,7 @@ services:
     networks: [private]
 
   ollama:
+    profiles: ["ai"]
     image: ollama/ollama:latest
     environment:
       OLLAMA_MAX_LOADED_MODELS: "1"
@@ -201,6 +203,7 @@ services:
     networks: [private]
 
   ollama-model:
+    profiles: ["ai"]
     image: ollama/ollama:latest
     environment:
       OLLAMA_HOST: http://ollama:11434

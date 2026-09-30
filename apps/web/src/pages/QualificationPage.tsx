@@ -1,7 +1,7 @@
 import { BrainCircuit, CheckCircle2, Gauge } from 'lucide-react';
 import { useState } from 'react';
 import { Link } from 'react-router-dom';
-import { api, queryString, type Qualification, type QualificationSummary } from '../api';
+import { api, queryString, type Lead, type Qualification, type QualificationSummary } from '../api';
 import { Badge, EmptyState, LoadingRows, PageHeader, Panel, Score, StatCard } from '../components/Ui';
 import { usePolling } from '../hooks/usePolling';
 
@@ -20,6 +20,7 @@ const emptySummary: QualificationSummary = {
 
 export function QualificationPage() {
   const [items, setItems] = useState<Qualification[]>([]);
+  const [recentlyDiscovered, setRecentlyDiscovered] = useState<Lead[]>([]);
   const [summary, setSummary] = useState<QualificationSummary>(emptySummary);
   const [filter, setFilter] = useState<(typeof filters)[number][0]>('actionable');
   const [page, setPage] = useState(0);
@@ -30,11 +31,11 @@ export function QualificationPage() {
     try {
       const opportunity = ['new_website', 'website_improvement', 'manual_review'].includes(filter) ? filter : undefined;
       const qualified = filter === 'actionable' ? true : undefined;
-      const value = await api<{ qualifications: Qualification[]; summary: QualificationSummary; total: number }>(`/api/qualifications${queryString({ qualified, opportunity, limit: 100, offset: page * 100 })}`);
-      setItems(value.qualifications); setTotal(value.total); setSummary(value.summary); setError('');
+      const value = await api<{ qualifications: Qualification[]; summary: QualificationSummary; total: number; recentlyDiscovered: Lead[] }>(`/api/qualifications${queryString({ qualified, opportunity, limit: 100, offset: page * 100 })}`);
+      setItems(value.qualifications); setRecentlyDiscovered(value.recentlyDiscovered); setTotal(value.total); setSummary(value.summary); setError('');
     } catch (reason) { setError(reason instanceof Error ? reason.message : String(reason)); }
     finally { setLoading(false); }
-  }, 5_000, `${filter}:${page}`);
+  }, 2_500, `${filter}:${page}`);
   return <>
     <PageHeader eyebrow="LEAD PRIORITIZATION" title="Qualification" description="Qualified leads need a new website or improvements supported by collected evidence. Higher outreach-priority scores mean stronger opportunities—not better websites. AI adds explanations without blocking the pipeline." />
     <section className="stats-grid stats-grid-three">
@@ -42,6 +43,11 @@ export function QualificationPage() {
       <StatCard label="Qualified leads" value={summary.qualified} note={`${summary.new_website} no website · ${summary.website_improvement} incomplete`} icon={CheckCircle2} tone="green" />
       <StatCard label="AI explanations" value={summary.ai_explained} note={`${summary.ai_pending} pending · ${summary.ai_fallback} rules fallback`} icon={Gauge} tone="violet" />
     </section>
+    <Panel title="Recently discovered" subtitle="New Maps results appear here while website checks and qualification run.">
+      <div className="table-wrap"><table><thead><tr><th>Business</th><th>Location</th><th>Website</th><th>Stage</th></tr></thead>
+        <tbody>{recentlyDiscovered.map((lead) => <tr key={lead.id}><td><Link className="table-title" to={`/businesses/${lead.id}`}>{lead.name}</Link></td><td>{lead.city ?? lead.country}</td><td>{lead.website ? 'Checking website' : 'No website listed'}</td><td><Badge value={lead.status} /></td></tr>)}</tbody>
+      </table>{!recentlyDiscovered.length && <p className="run-progress">No businesses are awaiting evaluation.</p>}</div>
+    </Panel>
     <Panel title="Ranked qualification results" subtitle="Higher score = stronger outreach opportunity. Filter by no website or improvement needs." action={<div className="segmented">{filters.map(([value, label]) => <button key={value} className={filter === value ? 'active' : ''} onClick={() => { setPage(0); setFilter(value); }}>{label}</button>)}</div>}>
       {error && <div className="alert">{error}</div>}
       <div className="qualification-list">{items.map((item) => {

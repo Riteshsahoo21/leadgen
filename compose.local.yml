@@ -1,0 +1,62 @@
+name: leadforge-local
+
+# Use with compose.yml. Only the loopback dashboard port is published.
+services:
+  api:
+    cpus: 0.25
+    mem_limit: 192m
+    environment:
+      APP_ORIGIN: http://localhost:8088,http://127.0.0.1:8088
+      ENABLE_AI: "false"
+      ENABLE_EMAIL_SENDING: ${ENABLE_EMAIL_SENDING:-false}
+  worker:
+    cpus: 1.0
+    mem_limit: 384m
+    environment:
+      CRAWL_CONCURRENCY: "1"
+      AI_CONCURRENCY: "1"
+      SEARCH_CONCURRENCY: "1"
+      ENRICHMENT_CONCURRENCY: "1"
+      ENABLE_AI: "false"
+      ENABLE_EMAIL_SENDING: ${ENABLE_EMAIL_SENDING:-false}
+  postgres:
+    cpus: 0.5
+    mem_limit: 256m
+  redis:
+    cpus: 0.2
+    mem_limit: 128m
+  gmaps:
+    cpus: 2.0
+    mem_limit: 1536m
+    memswap_limit: 1536m
+    command: ["-web", "-addr", ":8080", "-data-folder", "/gmapsdata", "-c", "3", "-browser-pool-size", "1", "-pages-per-browser", "3"]
+    volumes: !override
+      - gmaps_data:/gmapsdata
+    # Direct local IP; proxy credentials are not mounted.
+  searxng:
+    cpus: 0.5
+    mem_limit: 256m
+  web:
+    cpus: 0.1
+    mem_limit: 48m
+  caddy:
+    cpus: 0.1
+    mem_limit: 64m
+    ports: !override
+      - "127.0.0.1:8088:80"
+    volumes:
+      - ./deploy/Caddyfile.local:/etc/caddy/Caddyfile:ro
+  # Completely disabled locally to free CPU and RAM
+  ollama:
+    profiles: !override ["ai-disabled-local"]
+  ollama-model:
+    profiles: !override ["ai-disabled-local"]
+  backup:
+    profiles: !override ["backup-disabled-local"]
+  # Local processing must never accidentally start a second mail system.
+  posta:
+    profiles: !override ["mail-disabled-local"]
+  posta-db:
+    profiles: !override ["mail-disabled-local"]
+  posta-redis:
+    profiles: !override ["mail-disabled-local"]

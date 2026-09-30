@@ -5,9 +5,9 @@ import { reconcileActiveRuns, stageQueues } from './reconcile.js';
 import {
   closeDatabase, createMessage, eligibleEmail, getCompany, getEvidence, getRun, insertCompany, isRunCancelled, pool,
   logEvent, markDiscoveryFinished, maybeCompleteRun, refreshRunStats, saveContact, saveEmail,
-  saveEvidence, saveQualification, setRunStatus, updateCompanyFilter, updateCompanyStatus, mergePublicContactEvidence,
+  saveEvidence, saveQualificationWithinQuota, setRunStatus, updateCompanyFilter, updateCompanyStatus, mergePublicContactEvidence,
 } from './db.js';
-import { calculateFilterScore, type BusinessCandidate, type CreateRunInput } from './domain.js';
+import { calculateFilterScore, normalizeDomain, type BusinessCandidate, type CreateRunInput } from './domain.js';
 import { closeQueues, connection, enqueue } from './queues.js';
 import {
   buildDiscoveryKeywords, crawlWebsite, discoverBusinesses, enrichEmails, findDecisionMakers, parseOwner, parseStringList,
@@ -75,7 +75,7 @@ addWorker('discovery', async (job: Job<RunJob>) => {
   await pool.query("UPDATE discovery_runs SET status='running',started_at=COALESCE(started_at,now()),completed_at=NULL WHERE id=$1 AND status='queued'", [run.id]);
   const input: CreateRunInput = {
     name: run.name, country: run.country, cities: run.cities, businessTypes: run.business_types,
-    targetCount: Math.min(run.target_count, config.MAX_DISCOVERY_RESULTS),
+    targetCount: Number(run.target_count), maxDiscovery: Number(run.max_discovery || run.target_count * 2),
   };
   const state = run.discovery_state ?? {};
   const keywords: string[] = state.keywords ?? buildDiscoveryKeywords(input);
@@ -85,43 +85,77 @@ addWorker('discovery', async (job: Job<RunJob>) => {
     await pool.query('UPDATE discovery_runs SET discovery_state=$2 WHERE id=$1',
       [run.id, { keywords, cursor, jobId, ...(reason ? { reason } : {}) }]);
   };
-  await saveState();
   let count = Number((await pool.query('SELECT count(*) FROM companies WHERE run_id=$1', [run.id])).rows[0].count);
-  while (cursor < keywords.length && count < input.targetCount) {
+  const getQualifiedCount = async () => Number((await pool.query(
+    `SELECT count(*) FROM companies c JOIN qualifications q ON q.company_id=c.id
+     WHERE c.run_id=$1 AND q.qualified AND c.status <> 'research_queued'`,
+    [run.id]
+  )).rows[0].count);
+  let qualifiedCount = await getQualifiedCount();
+
+  while (cursor < keywords.length && qualifiedCount < input.targetCount) {
+    const searchKeywords = keywords.slice(cursor, cursor + 3);
     if (await isRunCancelled(run.id)) return;
-    await logEvent(run.id, 'discovery', `Search batch ${cursor + 1}/${keywords.length}; ${count}/${input.targetCount} unique businesses stored`);
-    const businesses = await discoverBusinesses(
-      input,
-      () => isRunCancelled(run.id),
-      { keywords: [keywords[cursor]!], ...(jobId ? { jobId } : {}),
-        saveJob: async (id) => { jobId = id; await saveState(); } },
-    );
-    if (await isRunCancelled(run.id)) return;
-    for (const business of businesses) {
-      if (count >= input.targetCount || await isRunCancelled(run.id)) break;
-      business.country ||= input.country;
-      const company = await insertCompany(run.id, business);
-      if (company.status === 'discovered') {
-        await enqueue('filter', 'filter-company', { runId: run.id, companyId: company.id }, `filter:${company.id}`);
+    await logEvent(run.id, 'discovery', `Search batch ${cursor + 1}-${cursor + searchKeywords.length}/${keywords.length}; ${qualifiedCount}/${input.targetCount} qualified leads (${count} scraped)`);
+    try {
+      const businesses = await discoverBusinesses(
+        { ...input, maxDiscovery: Math.max(30, Math.min(90, Math.ceil((input.targetCount - qualifiedCount) * 2))) },
+        () => isRunCancelled(run.id),
+        { keywords: searchKeywords, ...(jobId ? { jobId } : {}),
+          saveJob: async (id) => { jobId = id; await saveState(); } },
+      );
+      if (await isRunCancelled(run.id)) return;
+      for (const business of businesses) {
+        if (await isRunCancelled(run.id)) break;
+        business.country ||= input.country;
+        const company = await insertCompany(run.id, business);
+        if (company.status === 'discovered') {
+          await enqueue('filter', 'filter-company', { runId: run.id, companyId: company.id }, `filter:${company.id}`);
+        }
+        await maybeRefresh(run.id);
       }
       count = Number((await pool.query('SELECT count(*) FROM companies WHERE run_id=$1', [run.id])).rows[0].count);
+    } catch (batchError) {
+      if (batchError instanceof RunPausedError) throw batchError;
+      if (await isRunCancelled(run.id)) return;
+      console.warn(`[discovery] Search batch ${cursor + 1} error:`, batchError instanceof Error ? batchError.message : String(batchError));
+      await logEvent(run.id, 'discovery', `Search batch ${cursor + 1} skipped due to issue: ${batchError instanceof Error ? batchError.message : String(batchError)}`);
     }
     if (await isRunCancelled(run.id)) return;
-    cursor += 1;
+    cursor += searchKeywords.length;
     jobId = undefined;
     await saveState();
     await refreshRunStats(run.id);
+    qualifiedCount = await getQualifiedCount();
   }
   if (await isRunCancelled(run.id)) return;
-  const reason = count >= input.targetCount ? 'target_reached' : 'search_plan_exhausted';
+
+  // If we just finished scraping, wait briefly for in-flight qualifications to finish
+  let inFlight = Number((await pool.query(
+    `SELECT count(*) FROM companies WHERE run_id=$1 AND status IN ('discovered', 'crawl_queued', 'crawling', 'qualify_queued', 'qualifying')`,
+    [run.id]
+  )).rows[0].count);
+  let waitRounds = 0;
+  while (inFlight > 0 && qualifiedCount < input.targetCount && waitRounds < 15) {
+    if (await isRunCancelled(run.id)) return;
+    await new Promise((resolve) => setTimeout(resolve, 2000));
+    qualifiedCount = await getQualifiedCount();
+    inFlight = Number((await pool.query(
+      `SELECT count(*) FROM companies WHERE run_id=$1 AND status IN ('discovered', 'crawl_queued', 'crawling', 'qualify_queued', 'qualifying')`,
+      [run.id]
+    )).rows[0].count);
+    waitRounds += 1;
+  }
+
+  const reason = qualifiedCount >= input.targetCount ? 'target_reached' : 'search_plan_exhausted';
   await saveState(reason);
   await markDiscoveryFinished(run.id);
   await refreshRunStats(run.id);
   await logEvent(run.id, 'discovery', reason === 'target_reached'
-    ? `Discovery target reached: ${count}/${input.targetCount}. Remaining stages are processing.`
-    : `Search plan exhausted: ${count}/${input.targetCount} unique businesses. Add cities or categories to broaden coverage; no results were fabricated.`);
+    ? `Discovery target reached: ${qualifiedCount}/${input.targetCount} qualified leads from ${count} businesses. Remaining stages are processing.`
+    : `Search plan completed: ${qualifiedCount}/${input.targetCount} qualified leads (${count} businesses scraped). Add cities or categories to broaden coverage.`);
   await maybeCompleteRun(run.id);
-  return { discovered: count, reason };
+  return { discovered: count, qualified: qualifiedCount, reason };
 }, 1);
 
 addWorker('filter', async (job: Job<CompanyJob>) => {
@@ -149,11 +183,13 @@ addWorker('crawl', async (job: Job<CompanyJob>) => {
     await saveEvidence(company.id, evidence);
     await updateCompanyStatus(company.id, 'qualify_queued');
     await enqueue('qualify', 'qualify-company', job.data, `qualify:${company.id}`);
+    await maybeRefresh(company.run_id);
   } catch (error) {
     if (await isRunCancelled(company.run_id)) return { cancelled: true };
     await saveEvidence(company.id, { pagesCrawled: 0, crawlError: error instanceof Error ? error.message : String(error) });
     await updateCompanyStatus(company.id, 'qualify_queued');
     await enqueue('qualify', 'qualify-company', job.data, `qualify:${company.id}`);
+    await maybeRefresh(company.run_id);
   }
 }, config.CRAWL_CONCURRENCY);
 
@@ -163,15 +199,18 @@ addWorker('qualify', async (job: Job<CompanyJob>) => {
   const evidence = await getEvidence(company.id);
   const qualification = await qualifyBusiness(fromCompany(company), evidence, false);
   if (await isRunCancelled(company.run_id)) return { cancelled: true };
-  await saveQualification(company.id, { ...qualification,
-    aiStatus: qualification.qualified && company.website && config.PROVIDER_MODE === 'live' ? 'pending' : 'not_requested',
+
+  const aiEnabled = config.ENABLE_AI && config.PROVIDER_MODE === 'live';
+  const savedQualification = await saveQualificationWithinQuota(company.id, company.run_id, {
+    ...qualification,
+    aiStatus: qualification.qualified && company.website && aiEnabled ? 'pending' : 'not_requested',
   });
-  if (!qualification.qualified) {
+  if (!savedQualification.qualified) {
     await updateCompanyStatus(company.id, 'unqualified');
     await finishOne(company.run_id);
     return;
   }
-  if (company.website && config.PROVIDER_MODE === 'live') {
+  if (company.website && aiEnabled) {
     await enqueue('ai', 'explain-qualification', job.data, `ai:${company.id}`);
   }
   await updateCompanyStatus(company.id, 'research_queued');
@@ -180,6 +219,7 @@ addWorker('qualify', async (job: Job<CompanyJob>) => {
 }, 6);
 
 addWorker('ai', async (job: Job<CompanyJob>) => {
+  if (!config.ENABLE_AI) return;
   const company = await getCompany(job.data.companyId);
   if (!company) return;
   const evidence = await getEvidence(company.id);
@@ -211,6 +251,42 @@ addWorker('research', async (job: Job<CompanyJob>) => {
   const publicResearch = await researchPublicContacts(candidate, evidence);
   if (await isRunCancelled(company.run_id)) return { cancelled: true };
   await mergePublicContactEvidence(company.id, publicResearch);
+
+  // If the company lacked a website on Google Maps, check if research discovered their official website or domain
+  if (!company.website) {
+    let discoveredWebsite = publicResearch.searchResults.find((r) => {
+      if (!r.url) return false;
+      const d = normalizeDomain(r.url);
+      if (!d || /(?:facebook|linkedin|instagram|twitter|x\.com|youtube|yellowpages|cylex|ezyfind|snupit|google|bing|yahoo|africabizinfo|biz)\b/i.test(d)) return false;
+      const tokens = company.name.toLowerCase().split(/[^a-z0-9]+/).filter((t: string) => t.length >= 3 && !['pty','ltd','the','and','for'].includes(t));
+      return tokens.some((t: string) => d.includes(t));
+    })?.url;
+
+
+
+    if (discoveredWebsite) {
+      const normDomain = normalizeDomain(discoveredWebsite);
+      company.website = discoveredWebsite;
+      company.domain = normDomain;
+      candidate.website = discoveredWebsite;
+      await pool.query('UPDATE companies SET website=$2, domain=$3 WHERE id=$1', [company.id, discoveredWebsite, normDomain]);
+      await logEvent(company.run_id, 'research', `Discovered official website for ${company.name}: ${discoveredWebsite}`, company.id);
+      try {
+        await saveEvidence(company.id, await crawlWebsite(candidate));
+      } catch (error) {
+        await saveEvidence(company.id, { pagesCrawled: 0, crawlError: error instanceof Error ? error.message : String(error) });
+      }
+      evidence = await getEvidence(company.id);
+      const revised = await qualifyBusiness(candidate, evidence, false);
+      const saved = await saveQualificationWithinQuota(company.id, company.run_id, { ...revised, aiStatus: 'not_requested' });
+      if (!saved.qualified) {
+        await updateCompanyStatus(company.id, 'unqualified');
+        await finishOne(company.run_id);
+        return;
+      }
+    }
+  }
+
   const contacts = await findDecisionMakers(candidate, 'Owner', publicResearch.searchResults);
   if (!contacts.length && publicResearch.emails.length) {
     const emailSource = publicResearch.sources.find((source) => source.kind === 'email');
@@ -218,6 +294,14 @@ addWorker('research', async (job: Job<CompanyJob>) => {
       fullName: company.name, role: 'Business contact',
       confidence: emailSource?.sourceType === 'company_website' || emailSource?.sourceType === 'google_maps' ? 82 : 68,
       ...(emailSource?.sourceUrl ? { sourceUrl: emailSource.sourceUrl } : {}),
+    });
+  }
+  if (!contacts.length && (company.domain || company.website || candidate.publicEmails?.length)) {
+    contacts.push({
+      fullName: company.name,
+      role: 'General Enquiries',
+      confidence: 60,
+      ...(candidate.website ? { sourceUrl: candidate.website } : {}),
     });
   }
   if (!contacts.length) {
@@ -293,20 +377,27 @@ addWorker('campaign', async (job: Job<CompanyJob & { emailId: string }>) => {
 
 function fromCompany(company: Record<string, any>): BusinessCandidate {
   const raw = company.raw_data as Record<string, unknown> | undefined;
+  const emails = [
+    ...parseStringList(raw?.emails),
+    ...parseStringList(raw?.email),
+    ...parseStringList(raw?.Email),
+    ...parseStringList(raw?.Emails),
+  ];
   return {
     sourceId: company.source_id, name: company.name, category: company.category,
     categories: company.categories, country: company.country, city: company.city,
     address: company.address, phone: company.phone, website: company.website,
     rating: company.rating == null ? undefined : Number(company.rating), reviewCount: company.review_count,
     latitude: company.latitude, longitude: company.longitude,
-    publicEmails: parseStringList(raw?.emails), owner: parseOwner(raw?.owner), raw,
+    publicEmails: [...new Set(emails.map((e) => e.trim().toLowerCase()).filter(Boolean))],
+    owner: parseOwner(raw?.owner), raw,
   };
 }
 
-async function maybeRefresh(runId: string) {
+async function maybeRefresh(runId: string, force = false) {
   const previous = refreshCounters.get(runId) ?? { count: 0, refreshedAt: 0 };
   const next = { count: previous.count + 1, refreshedAt: previous.refreshedAt };
-  if (next.count % 25 === 0 || Date.now() - next.refreshedAt >= 5_000) {
+  if (force || next.count % 3 === 0 || Date.now() - next.refreshedAt >= 1_500) {
     await refreshRunStats(runId);
     next.refreshedAt = Date.now();
   }

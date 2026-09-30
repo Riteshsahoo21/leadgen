@@ -10,7 +10,11 @@
     "dev": "concurrently -n api,worker,web -c cyan,magenta,green \"npm run dev -w @leadforge/server\" \"npm run dev:worker -w @leadforge/server\" \"npm run dev -w @leadforge/web\"",
     "build": "npm run build -w @leadforge/server && npm run build -w @leadforge/web",
     "test": "npm run test -w @leadforge/server",
-    "typecheck": "npm run typecheck -w @leadforge/server && npm run typecheck -w @leadforge/web"
+    "typecheck": "npm run typecheck -w @leadforge/server && npm run typecheck -w @leadforge/web",
+    "local:up": "docker compose -f compose.yml -f compose.local.yml up -d --build",
+    "local:down": "docker compose -f compose.yml -f compose.local.yml down",
+    "local:ps": "docker compose -f compose.yml -f compose.local.yml ps",
+    "local:logs": "docker compose -f compose.yml -f compose.local.yml logs -f api worker"
   },
   "devDependencies": {
     "concurrently": "^9.2.1",

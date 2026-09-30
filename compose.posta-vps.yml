@@ -1,0 +1,79 @@
+name: leadforge-mail
+
+services:
+  posta-db:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: posta
+      POSTGRES_PASSWORD: ${POSTA_DB_PASSWORD:?Set POSTA_DB_PASSWORD}
+      POSTGRES_DB: posta
+    command: ["postgres", "-c", "shared_buffers=64MB", "-c", "max_connections=40"]
+    volumes:
+      - posta_db:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U posta -d posta"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+    cpus: 0.3
+    mem_limit: 256m
+    memswap_limit: 256m
+    networks: [mail]
+  posta-redis:
+    image: redis:7.4-alpine
+    command: ["redis-server", "--appendonly", "yes", "--maxmemory", "64mb", "--maxmemory-policy", "noeviction"]
+    volumes:
+      - posta_redis:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+    cpus: 0.2
+    mem_limit: 128m
+    memswap_limit: 128m
+    networks: [mail]
+  posta:
+    image: ${POSTA_IMAGE:-jkaninda/posta:latest}
+    environment:
+      POSTA_ENV: production
+      POSTA_DB_URL: host=posta-db user=posta password=${POSTA_DB_PASSWORD} dbname=posta port=5432 sslmode=disable
+      POSTA_REDIS_ADDR: posta-redis:6379
+      POSTA_JWT_SECRET: ${POSTA_JWT_SECRET:?Set POSTA_JWT_SECRET}
+      POSTA_ADMIN_EMAIL: ${POSTA_ADMIN_EMAIL:?Set POSTA_ADMIN_EMAIL}
+      POSTA_ADMIN_PASSWORD: ${POSTA_ADMIN_PASSWORD:?Set POSTA_ADMIN_PASSWORD}
+      POSTA_ENCRYPTION_KEY: ${POSTA_ENCRYPTION_KEY:?Set POSTA_ENCRYPTION_KEY}
+      POSTA_WEB_URL: ${POSTA_PUBLIC_URL:-https://ritzla.in}
+      POSTA_CORS_ORIGINS: ${POSTA_PUBLIC_URL:-https://ritzla.in}
+      POSTA_EMBEDDED_WORKER: "true"
+      POSTA_WORKER_CONCURRENCY: "1"
+      POSTA_AUTO_SUPPRESS_ON_REJECT: "true"
+      # Enable listeners only after DNS, TLS, and mail delivery are configured.
+      POSTA_INBOUND_ENABLED: "false"
+      POSTA_RELAY_ENABLED: "false"
+    ports:
+      - "127.0.0.1:9000:9000"
+    depends_on:
+      posta-db: { condition: service_healthy }
+      posta-redis: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:9000/healthz"]
+      interval: 15s
+      timeout: 5s
+      start_period: 30s
+      retries: 10
+    restart: unless-stopped
+    cpus: 0.5
+    mem_limit: 384m
+    memswap_limit: 384m
+    pids_limit: 150
+    networks: [mail]
+
+networks:
+  mail:
+    driver: bridge
+volumes:
+  posta_db:
+  posta_redis:
