@@ -97,7 +97,7 @@ Browser → Caddy → React / Fastify
 
 PostgreSQL is the source of truth. Redis contains only recoverable queue state. BullMQ runs separate queues for discovery, filtering, crawling, AI qualification, research, enrichment, and campaigns. Deduplication IDs prevent the same stage from being queued twice for one business.
 
-The worker uses ordinary HTTP first and launches Chromium only when a site returns too little meaningful HTML. A process-wide lock permits only one fallback browser at a time. Ollama and the Maps scraper also run at concurrency one by default.
+The worker uses Crawlee (CheerioCrawler and PlaywrightCrawler) with gotScraping for website crawling and public contact page extraction, falling back to headless Chromium when client-side JavaScript rendering is required. Ollama and the Maps scraper also run at concurrency one by default.
 
 Ollama is capped to one vCPU by default with `OLLAMA_CPU_LIMIT=1.0`. Qwen is unloaded immediately after every request, so the Ollama API remains idle between queued qualification jobs instead of retaining the model or consuming inference CPU continuously. Lowering the quota further reduces impact but increases qualification time.
 
@@ -217,4 +217,4 @@ n8n would be faster for a tiny proof of concept and convenient for ad-hoc integr
 
 Use a lawful basis for collecting and contacting people, retain only necessary public business data, honor opt-outs immediately, and follow applicable privacy, marketing, and platform rules. Maps phone numbers are not permission for automated WhatsApp or SMS outreach. Keep AI replies as drafts until their accuracy and tone have been reviewed.
 
-Primary upstream references: [Google Maps Scraper](https://github.com/gosom/google-maps-scraper), [BullMQ](https://docs.bullmq.io/), [Ollama](https://ollama.com/), [SearXNG](https://github.com/searxng/searxng), and [Posta](https://github.com/goposta/posta).
+Primary upstream references: [Crawlee](https://crawlee.dev/), [Google Maps Scraper](https://github.com/gosom/google-maps-scraper), [BullMQ](https://docs.bullmq.io/), [Ollama](https://ollama.com/), [SearXNG](https://github.com/searxng/searxng), and [Posta](https://github.com/goposta/posta).

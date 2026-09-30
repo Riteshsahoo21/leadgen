@@ -3,11 +3,11 @@ import dns from 'node:dns/promises';
 import nodeDns from 'node:dns';
 import { load } from 'cheerio';
 import { parse } from 'csv-parse/sync';
-import { CheerioCrawler, PlaywrightCrawler, Configuration, LogLevel, log as crawleeLog } from 'crawlee';
+import { CheerioCrawler, PlaywrightCrawler, Configuration, LogLevel, log as crawleeLog, gotScraping } from 'crawlee';
 import { config } from './config.js';
 import { calculateQualificationScore, normalizeDomain, type BusinessCandidate, type CreateRunInput } from './domain.js';
 
-crawleeLog.setLevel(LogLevel.OFF);
+crawleeLog.setLevel(LogLevel.WARNING);
 
 try {
   const currentServers = nodeDns.getServers();
@@ -259,13 +259,18 @@ export async function crawlWebsite(candidate: BusinessCandidate): Promise<Websit
 
   const root = new URL(candidate.website.includes('://') ? candidate.website : `https://${candidate.website}`);
   const documents: Array<{ url: string; html: string }> = [];
-  const crawleeConfig = new Configuration({ persistStorage: false, purgeOnStart: true });
+  const crawleeConfig = new Configuration({
+    persistStorage: false,
+    purgeOnStart: true,
+    memoryMbytes: 1024,
+    availableMemoryRatio: 0.95,
+  });
 
   const runCheerioCrawl = async (startUrl: string) => {
     const crawler = new CheerioCrawler({
       maxRequestsPerCrawl: config.MAX_PAGES_PER_SITE,
       maxConcurrency: 3,
-      requestHandlerTimeoutSecs: 10,
+      requestHandlerTimeoutSecs: 15,
       maxRequestRetries: 1,
       async requestHandler({ $, request, enqueueLinks }) {
         const html = $.html();
@@ -278,10 +283,15 @@ export async function crawlWebsite(candidate: BusinessCandidate): Promise<Websit
               const u = new URL(req.url);
               u.hash = '';
               u.search = '';
+              if (/\.(?:pdf|docx?|xlsx?|pptx?|zip|rar|tar|gz|mp4|mp3|avi|png|jpe?g|gif|webp|svg|ico|css|js|woff2?|xml|json|txt)$/i.test(u.pathname)) {
+                return false;
+              }
               req.url = u.toString();
               const priority = pagePriority(req.url);
-              if (priority === 0) return false;
               req.userData = { priority };
+              if (priority >= 60) {
+                (req as any).forefront = true;
+              }
               return req;
             } catch {
               return false;
@@ -546,13 +556,13 @@ export function websiteIdentityMismatch(candidate: BusinessCandidate, title: str
 }
 
 function pagePriority(value: string) {
-  if (/contact|reach-us|get-in-touch/i.test(value)) return 100;
+  if (/contact|reach-us|get-in-touch|enquiry|inquiry|quote|rfq/i.test(value)) return 100;
   if (/booking|appointment|schedule|reserve|checkout|cart|basket|order|shop|store/i.test(value)) return 90;
-  if (/about|team|staff|leadership|founder/i.test(value)) return 75;
-  if (/services?|products?|solutions?|menu|pricing|plans?/i.test(value)) return 65;
+  if (/about|team|staff|leadership|founder|who-we-are|profile|history/i.test(value)) return 75;
+  if (/services?|products?|solutions?|manufacturing|factory|plant|capabilities|infrastructure|projects|menu|pricing|plans?/i.test(value)) return 65;
   if (/privacy|terms|legal|impressum|imprint|policy/i.test(value)) return 60;
-  if (/support|help|faq|locations?|branches/i.test(value)) return 50;
-  return 0;
+  if (/support|help|faq|locations?|branches|distributors/i.test(value)) return 50;
+  return 10;
 }
 
 function sameHostname(left: URL, right: URL) {
@@ -826,16 +836,15 @@ async function crawlPublicContactPage(url: string) {
   if (/(?:google|bing|yahoo|duckduckgo|searx|yandex|baidu)\./i.test(url)) return { url, emails: [], phones: [] };
   if (/\.(?:pdf|docx?|xlsx?|pptx?|zip|rar|tar|gz|mp4|mp3|avi|png|jpe?g|gif|webp|svg)$/i.test(url)) return { url, emails: [], phones: [] };
   try {
-    const response = await fetch(url, {
-      headers: {
-        'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
-        'accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-        'accept-language': 'en-ZA,en-GB;q=0.9,en;q=0.8',
-      },
-      redirect: 'follow', signal: AbortSignal.timeout(10_000),
+    const response = await gotScraping({
+      url,
+      timeout: { request: 10_000 },
+      responseType: 'text',
+      retry: { limit: 0 },
     });
-    if (!response.ok || !response.headers.get('content-type')?.includes('text/html')) return { url, emails: [], phones: [] };
-    const $ = load((await response.text()).slice(0, 500_000));
+    const contentType = String(response.headers['content-type'] ?? '');
+    if (!contentType.includes('text/html')) return { url, emails: [], phones: [] };
+    const $ = load((response.body as string).slice(0, 500_000));
     $('script,style,noscript,svg').remove();
     $('br,p,div,li,td,th,h1,h2,h3,h4,h5,h6,section,article,a,span').after(' ');
     const text = $('body').text().replace(/\s+/g, ' ').slice(0, 40_000);

@@ -178,15 +178,32 @@ addWorker('crawl', async (job: Job<CompanyJob>) => {
   const company = await getCompany(job.data.companyId);
   if (!company) return;
   try {
+    console.log(`[worker:crawl] Crawlee crawling ${company.website} for "${company.name}" (ID: ${company.id})...`);
     const evidence = await crawlWebsite(fromCompany(company));
     if (await isRunCancelled(company.run_id)) return { cancelled: true };
     await saveEvidence(company.id, evidence);
+    await logEvent(
+      company.run_id,
+      'crawl',
+      `Crawlee crawled ${evidence.pagesCrawled} page${evidence.pagesCrawled === 1 ? '' : 's'} (${evidence.emails.length} emails, ${evidence.phones.length} phones)${evidence.usedBrowser ? ' [rendered with Playwright]' : ''}`,
+      company.id,
+      { pagesCrawled: evidence.pagesCrawled, emailsFound: evidence.emails.length, usedBrowser: evidence.usedBrowser }
+    );
     await updateCompanyStatus(company.id, 'qualify_queued');
     await enqueue('qualify', 'qualify-company', job.data, `qualify:${company.id}`);
     await maybeRefresh(company.run_id);
   } catch (error) {
     if (await isRunCancelled(company.run_id)) return { cancelled: true };
-    await saveEvidence(company.id, { pagesCrawled: 0, crawlError: error instanceof Error ? error.message : String(error) });
+    const errMsg = error instanceof Error ? error.message : String(error);
+    console.warn(`[worker:crawl] Crawlee crawl failed for "${company.name}" (${company.website}): ${errMsg}`);
+    await saveEvidence(company.id, { pagesCrawled: 0, crawlError: errMsg });
+    await logEvent(
+      company.run_id,
+      'crawl',
+      `Crawlee crawl failed for ${company.website}: ${errMsg}`,
+      company.id,
+      { error: errMsg }
+    );
     await updateCompanyStatus(company.id, 'qualify_queued');
     await enqueue('qualify', 'qualify-company', job.data, `qualify:${company.id}`);
     await maybeRefresh(company.run_id);
