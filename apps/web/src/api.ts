@@ -2,6 +2,10 @@ export type RunStats = {
   ai_pending?: number;
   no_website?: number;
   incomplete_website?: number;
+  deferred_website?: number;
+  discovery_active?: boolean;
+  discovery_phase?: string;
+  discovery_batch?: number;
   ai_explained?: number;
   target?: number;
   discovered: number;
@@ -25,7 +29,8 @@ export type Run = {
   status: string;
   provider_mode: string;
   stats: RunStats;
-  discovery_state?: { cursor?: number; keywords?: string[]; reason?: string };
+  discovery_finished_at?: string | null;
+  discovery_state?: { cursor?: number; keywords?: string[]; phase?: string; reason?: string };
   error?: string;
   created_at: string;
   updated_at?: string;

@@ -10,7 +10,7 @@ import {
 import { calculateFilterScore, normalizeDomain, type BusinessCandidate, type CreateRunInput } from './domain.js';
 import { closeQueues, connection, enqueue } from './queues.js';
 import {
-  buildDiscoveryKeywords, crawlWebsite, discoverBusinesses, enrichEmails, findDecisionMakers, parseOwner, parseStringList,
+  buildDiscoveryKeywords, buildNoWebsiteKeywords, crawlWebsite, discoverBusinesses, enrichEmails, findDecisionMakers, parseOwner, parseStringList,
   qualifyBusiness, researchPublicContacts, sendWithPosta,
 } from './providers.js';
 
@@ -77,40 +77,117 @@ addWorker('discovery', async (job: Job<RunJob>) => {
     name: run.name, country: run.country, cities: run.cities, businessTypes: run.business_types,
     targetCount: Number(run.target_count), maxDiscovery: Number(run.max_discovery || run.target_count * 2),
   };
+
+  const noWebsiteTarget = Math.ceil(input.targetCount * 0.6);
+  const incompleteTarget = input.targetCount - noWebsiteTarget;
+
   const state = run.discovery_state ?? {};
-  const keywords: string[] = state.keywords ?? buildDiscoveryKeywords(input);
+  let phase: 'no_website' | 'website_improvement' = state.phase ?? 'no_website';
+  let keywords: string[] = state.keywords ?? (phase === 'no_website' ? buildNoWebsiteKeywords(input) : buildDiscoveryKeywords(input));
   let cursor = Number(state.cursor ?? 0);
   let jobId: string | undefined = state.jobId;
+
   const saveState = async (reason?: string) => {
     await pool.query('UPDATE discovery_runs SET discovery_state=$2 WHERE id=$1',
-      [run.id, { keywords, cursor, jobId, ...(reason ? { reason } : {}) }]);
+      [run.id, { keywords, cursor, jobId, phase, ...(reason ? { reason } : {}) }]);
   };
-  let count = Number((await pool.query('SELECT count(*) FROM companies WHERE run_id=$1', [run.id])).rows[0].count);
-  const getQualifiedCount = async () => Number((await pool.query(
-    `SELECT count(*) FROM companies c JOIN qualifications q ON q.company_id=c.id
-     WHERE c.run_id=$1 AND q.qualified AND c.status <> 'research_queued'`,
-    [run.id]
-  )).rows[0].count);
-  let qualifiedCount = await getQualifiedCount();
 
-  while (cursor < keywords.length && qualifiedCount < input.targetCount) {
-    const searchKeywords = keywords.slice(cursor, cursor + 3);
+  let count = Number((await pool.query('SELECT count(*) FROM companies WHERE run_id=$1', [run.id])).rows[0].count);
+
+  const getOpportunityCounts = async () => {
+    const res = await pool.query<{ no_website: string; incomplete: string }>(
+      `SELECT
+         count(*) FILTER (WHERE q.qualified AND q.opportunity='new_website') AS no_website,
+         count(*) FILTER (WHERE q.qualified AND q.opportunity='website_improvement') AS incomplete
+       FROM qualifications q JOIN companies c ON c.id=q.company_id WHERE c.run_id=$1`,
+      [run.id]
+    );
+    return {
+      noWebsite: Number(res.rows[0]?.no_website ?? 0),
+      incomplete: Number(res.rows[0]?.incomplete ?? 0),
+    };
+  };
+
+  while (true) {
     if (await isRunCancelled(run.id)) return;
-    await logEvent(run.id, 'discovery', `Search batch ${cursor + 1}-${cursor + searchKeywords.length}/${keywords.length}; ${qualifiedCount}/${input.targetCount} qualified leads (${count} scraped)`);
+    const oppCounts = await getOpportunityCounts();
+    const qualifiedCount = oppCounts.noWebsite + oppCounts.incomplete;
+
+    if (qualifiedCount >= input.targetCount) break;
+
+    if (phase === 'no_website') {
+      if (oppCounts.noWebsite >= noWebsiteTarget || cursor >= keywords.length) {
+        await logEvent(run.id, 'discovery',
+          `Phase 1 completed: ${oppCounts.noWebsite}/${noWebsiteTarget} businesses without a website found. Transitioning to Phase 2: Websites Needing Improvement.`);
+
+        // Unfreeze deferred companies with websites collected during Phase 1
+        const deferred = await pool.query<{ id: string }>(
+          "SELECT id FROM companies WHERE run_id=$1 AND status='deferred_has_website'", [run.id]
+        );
+        for (const row of deferred.rows) {
+          await pool.query("UPDATE companies SET status='discovered' WHERE id=$1", [row.id]);
+          await enqueue('filter', 'filter-company', { runId: run.id, companyId: row.id }, `filter:${row.id}`);
+        }
+        if (deferred.rows.length > 0) {
+          await logEvent(run.id, 'discovery',
+            `Activated ${deferred.rows.length} businesses with websites collected during Phase 1 for crawling and qualification.`);
+        }
+
+        phase = 'website_improvement';
+        keywords = buildDiscoveryKeywords(input);
+        cursor = 0;
+        jobId = undefined;
+        await saveState();
+        await refreshRunStats(run.id);
+        continue;
+      }
+    } else {
+      if (oppCounts.incomplete >= incompleteTarget || cursor >= keywords.length) {
+        break;
+      }
+    }
+
+    const searchKeywords = keywords.slice(cursor, cursor + 3);
+    if (!searchKeywords.length) break;
+
+    const phaseLabel = phase === 'no_website' ? 'Phase 1: No-Website' : 'Phase 2: Website Improvement';
+    const phaseProgress = phase === 'no_website' ? `${oppCounts.noWebsite}/${noWebsiteTarget}` : `${oppCounts.incomplete}/${incompleteTarget}`;
+    await logEvent(run.id, 'discovery',
+      `[${phaseLabel}] Batch ${cursor + 1}-${cursor + searchKeywords.length}/${keywords.length}; ${phaseProgress} qualified (${count} scraped)`);
+
     try {
       const businesses = await discoverBusinesses(
         { ...input, maxDiscovery: Math.max(30, Math.min(90, Math.ceil((input.targetCount - qualifiedCount) * 2))) },
         () => isRunCancelled(run.id),
-        { keywords: searchKeywords, ...(jobId ? { jobId } : {}),
-          saveJob: async (id) => { jobId = id; await saveState(); } },
+        {
+          keywords: searchKeywords,
+          phase,
+          ...(jobId ? { jobId } : {}),
+          saveJob: async (id) => { jobId = id; await saveState(); },
+          onProgress: async (msg) => { await logEvent(run.id, 'discovery', msg); },
+        },
       );
       if (await isRunCancelled(run.id)) return;
+
       for (const business of businesses) {
         if (await isRunCancelled(run.id)) break;
         business.country ||= input.country;
-        const company = await insertCompany(run.id, business);
-        if (company.status === 'discovered') {
-          await enqueue('filter', 'filter-company', { runId: run.id, companyId: company.id }, `filter:${company.id}`);
+        const hasWebsite = Boolean(business.website && business.website.trim());
+
+        if (phase === 'no_website') {
+          if (!hasWebsite) {
+            const company = await insertCompany(run.id, business, 'discovered');
+            if (company.status === 'discovered') {
+              await enqueue('filter', 'filter-company', { runId: run.id, companyId: company.id }, `filter:${company.id}`);
+            }
+          } else {
+            await insertCompany(run.id, business, 'deferred_has_website');
+          }
+        } else {
+          const company = await insertCompany(run.id, business, 'discovered');
+          if (company.status === 'discovered') {
+            await enqueue('filter', 'filter-company', { runId: run.id, companyId: company.id }, `filter:${company.id}`);
+          }
         }
         await maybeRefresh(run.id);
       }
@@ -121,25 +198,25 @@ addWorker('discovery', async (job: Job<RunJob>) => {
       console.warn(`[discovery] Search batch ${cursor + 1} error:`, batchError instanceof Error ? batchError.message : String(batchError));
       await logEvent(run.id, 'discovery', `Search batch ${cursor + 1} skipped due to issue: ${batchError instanceof Error ? batchError.message : String(batchError)}`);
     }
+
     if (await isRunCancelled(run.id)) return;
     cursor += searchKeywords.length;
     jobId = undefined;
     await saveState();
     await refreshRunStats(run.id);
-    qualifiedCount = await getQualifiedCount();
   }
+
   if (await isRunCancelled(run.id)) return;
 
-  // If we just finished scraping, wait briefly for in-flight qualifications to finish
+  // Wait briefly for in-flight qualifications to finish
   let inFlight = Number((await pool.query(
     `SELECT count(*) FROM companies WHERE run_id=$1 AND status IN ('discovered', 'crawl_queued', 'crawling', 'qualify_queued', 'qualifying')`,
     [run.id]
   )).rows[0].count);
   let waitRounds = 0;
-  while (inFlight > 0 && qualifiedCount < input.targetCount && waitRounds < 15) {
+  while (inFlight > 0 && waitRounds < 15) {
     if (await isRunCancelled(run.id)) return;
     await new Promise((resolve) => setTimeout(resolve, 2000));
-    qualifiedCount = await getQualifiedCount();
     inFlight = Number((await pool.query(
       `SELECT count(*) FROM companies WHERE run_id=$1 AND status IN ('discovered', 'crawl_queued', 'crawling', 'qualify_queued', 'qualifying')`,
       [run.id]
@@ -147,15 +224,17 @@ addWorker('discovery', async (job: Job<RunJob>) => {
     waitRounds += 1;
   }
 
-  const reason = qualifiedCount >= input.targetCount ? 'target_reached' : 'search_plan_exhausted';
+  const finalCounts = await getOpportunityCounts();
+  const totalQualified = finalCounts.noWebsite + finalCounts.incomplete;
+  const reason = totalQualified >= input.targetCount ? 'target_reached' : 'search_plan_exhausted';
   await saveState(reason);
   await markDiscoveryFinished(run.id);
   await refreshRunStats(run.id);
   await logEvent(run.id, 'discovery', reason === 'target_reached'
-    ? `Discovery target reached: ${qualifiedCount}/${input.targetCount} qualified leads from ${count} businesses. Remaining stages are processing.`
-    : `Search plan completed: ${qualifiedCount}/${input.targetCount} qualified leads (${count} businesses scraped). Add cities or categories to broaden coverage.`);
+    ? `Discovery target reached: ${totalQualified}/${input.targetCount} qualified leads (${finalCounts.noWebsite} without website, ${finalCounts.incomplete} needing website improvement). Remaining stages are processing.`
+    : `Search plan completed: ${totalQualified}/${input.targetCount} qualified leads (${finalCounts.noWebsite} without website, ${finalCounts.incomplete} needing website improvement).`);
   await maybeCompleteRun(run.id);
-  return { discovered: count, qualified: qualifiedCount, reason };
+  return { discovered: count, qualified: totalQualified, reason };
 }, 1);
 
 addWorker('filter', async (job: Job<CompanyJob>) => {

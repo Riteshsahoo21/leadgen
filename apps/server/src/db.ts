@@ -103,20 +103,22 @@ export async function maybeCompleteRun(runId: string) {
   return false;
 }
 
-export async function insertCompany(runId: string, candidate: BusinessCandidate) {
-  const domain = normalizeDomain(candidate.website);
+export async function insertCompany(runId: string, candidate: BusinessCandidate, initialStatus = 'discovered') {
+  const website = candidate.website?.trim() || null;
+  const domain = normalizeDomain(website ?? undefined);
   const values = [
     runId, candidate.sourceId ?? null, candidate.name, normalizeName(candidate.name), candidate.category ?? null,
     candidate.categories ?? [], candidate.country, candidate.city ?? null, candidate.address ?? null,
-    candidate.phone ?? null, candidate.website ?? null, domain ?? null, candidate.rating ?? null,
+    candidate.phone ?? null, website, domain ?? null, candidate.rating ?? null,
     candidate.reviewCount ?? 0, candidate.latitude ?? null, candidate.longitude ?? null, candidate.raw ?? {},
+    initialStatus,
   ];
   const result = await pool.query(
     `WITH inserted AS (
      INSERT INTO companies (
        run_id, source_id, name, normalized_name, category, categories, country, city, address,
-       phone, website, domain, rating, review_count, latitude, longitude, raw_data
-     ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)
+       phone, website, domain, rating, review_count, latitude, longitude, raw_data, status
+     ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)
      ON CONFLICT DO NOTHING
      RETURNING *)
      SELECT * FROM inserted
@@ -316,11 +318,15 @@ export async function refreshRunStats(runId: string) {
        'qualified', (SELECT count(*) FROM companies c JOIN qualifications q ON q.company_id=c.id WHERE c.run_id=r.id AND q.qualified),
        'no_website', (SELECT count(*) FROM companies c JOIN qualifications q ON q.company_id=c.id WHERE c.run_id=r.id AND q.qualified AND q.opportunity='new_website'),
        'incomplete_website', (SELECT count(*) FROM companies c JOIN qualifications q ON q.company_id=c.id WHERE c.run_id=r.id AND q.qualified AND q.opportunity='website_improvement'),
+       'deferred_website', (SELECT count(*) FROM companies c WHERE c.run_id=r.id AND c.status='deferred_has_website'),
        'contacts', (SELECT count(DISTINCT x.company_id) FROM contacts x JOIN companies c ON c.id=x.company_id WHERE c.run_id=r.id),
        'verified', (SELECT count(DISTINCT e.company_id) FROM contact_emails e JOIN companies c ON c.id=e.company_id WHERE c.run_id=r.id AND e.verification_status='valid'),
        'pending', (SELECT count(*) FROM companies c WHERE c.run_id=r.id AND NOT (c.status = ANY($2::text[]))),
        'finished', (SELECT count(*) FROM companies c WHERE c.run_id=r.id AND c.status = ANY($2::text[])),
-       'contacted', (SELECT count(*) FROM messages m WHERE m.run_id=r.id AND m.direction='outbound' AND m.status IN ('sent','delivered'))
+       'contacted', (SELECT count(*) FROM messages m WHERE m.run_id=r.id AND m.direction='outbound' AND m.status IN ('sent','delivered')),
+       'discovery_active', (r.status = 'running' AND r.discovery_finished_at IS NULL),
+       'discovery_phase', COALESCE(r.discovery_state->>'phase', 'no_website'),
+       'discovery_batch', COALESCE((r.discovery_state->>'cursor')::int, 0)
      ) WHERE r.id=$1`,
     [runId, terminalCompanyStatuses],
   );

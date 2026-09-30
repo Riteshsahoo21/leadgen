@@ -3,7 +3,7 @@ import { CheerioCrawler } from 'crawlee';
 import { load } from 'cheerio';
 import { config } from './config.js';
 import {
-  crawlWebsite, enrichEmails, extractEmails, extractEvidence, extractPhones, mapsDepthFor, parseStringList, searchResultMatchesBusiness, websiteIdentityMismatch,
+  buildDiscoveryKeywords, buildNoWebsiteKeywords, crawlWebsite, enrichEmails, extractEmails, extractEvidence, extractPhones, mapsDepthFor, parseStringList, searchResultMatchesBusiness, websiteIdentityMismatch,
 } from './providers.js';
 
 const originalMode = config.PROVIDER_MODE;
@@ -23,9 +23,22 @@ describe('public contact extraction', () => {
     expect(extractPhones('Call +91 98765 43210 or (06762) 221-900')).toEqual(['+919876543210', '06762221900']);
   });
 
-  it('scales Maps depth with the requested volume and query count', () => {
+  it('scales Maps depth with the requested volume, query count, and phase', () => {
     expect(mapsDepthFor(100, 10)).toBe(1);
+    expect(mapsDepthFor(100, 10, 'no_website')).toBe(3);
     expect(mapsDepthFor(2_000, 12)).toBe(10);
+  });
+
+  it('generates targeted no-website keywords for industrial workshops and trading zones', () => {
+    const keywords = buildNoWebsiteKeywords({
+      name: 'Dubai Manufacturing',
+      country: 'United Arab Emirates',
+      cities: ['Dubai'],
+      businessTypes: ['Manufacturing', 'Packaging company'],
+      targetCount: 500,
+    });
+    expect(keywords.length).toBeGreaterThan(10);
+    expect(keywords.some((k) => k.includes('workshop') || k.includes('Al Quoz') || k.includes('Al Qusais') || k.includes('trading'))).toBe(true);
   });
 
   it('requires direct purchase controls instead of payment-provider mentions', () => {

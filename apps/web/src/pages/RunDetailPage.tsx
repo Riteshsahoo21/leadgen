@@ -30,14 +30,28 @@ export function RunDetailPage() {
     {run.error && <div className="alert">{run.error}</div>}
     <p className="run-progress" aria-live="polite">
       {formatNumber(run.stats.qualified)} / {formatNumber(run.target_count)} qualified leads
-      {' '}({formatNumber(run.stats.no_website ?? 0)} without a website;
-      {' '}{formatNumber(run.stats.incomplete_website ?? 0)} needing website improvements).
-      {' '}{formatNumber(run.stats.discovered)} businesses discovered; {run.stats.pending ?? 0} processing.
-      {state?.keywords && <> Search batches: {state.cursor ?? 0} / {state.keywords.length}.</>}
+      {' '}({formatNumber(run.stats.no_website ?? 0)} / {Math.ceil(run.target_count * 0.6)} without a website [Phase 1: 60%];
+      {' '}{formatNumber(run.stats.incomplete_website ?? 0)} / {run.target_count - Math.ceil(run.target_count * 0.6)} needing website improvements [Phase 2: 40%]).
+      {' '}{formatNumber(run.stats.discovered)} businesses discovered; {run.stats.pending ?? 0} processing in queue.
+      {Boolean(run.stats.deferred_website) && <> ({run.stats.deferred_website} websites deferred for Phase 2).</>}
+      {run.status === 'running' && !run.discovery_finished_at && state?.keywords && (
+        <span style={{ display: 'inline-block', marginLeft: '0.5rem', color: '#0ea5e9', fontWeight: 600 }}>
+          ● Scraping Google Maps: Batch {state.cursor ?? 0} / {state.keywords.length} ({state.phase === 'no_website' ? 'Phase 1: No-Website' : 'Phase 2: Website Improvement'})...
+        </span>
+      )}
       {state?.reason === 'search_plan_exhausted' && <> Search coverage exhausted below target. Add more cities or categories for additional unique results.</>}
       {run.status === 'paused' && <> Paused; queued work is retained. A current external request may finish.</>}
     </p>
-    <section className="run-kpis">{Object.entries(run.stats).map(([key, value]) => <div key={key}><span>{key.replaceAll('_', ' ')}</span><strong>{formatNumber(value ?? 0)}</strong></div>)}</section>
+    <section className="run-kpis">
+      {Object.entries(run.stats)
+        .filter(([, value]) => typeof value === 'number')
+        .map(([key, value]) => (
+          <div key={key}>
+            <span>{key.replaceAll('_', ' ')}</span>
+            <strong>{formatNumber(Number(value))}</strong>
+          </div>
+        ))}
+    </section>
     <Panel 
       title="Qualified Opportunities" 
       subtitle={`${total ? page * 100 + 1 : 0}–${Math.min((page + 1) * 100, total)} of ${total} records`}

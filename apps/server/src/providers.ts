@@ -56,14 +56,21 @@ export function safeBusinesses(input: CreateRunInput): BusinessCandidate[] {
 export async function discoverBusinesses(
   input: CreateRunInput,
   shouldStop?: () => Promise<boolean>,
-  checkpoint?: { jobId?: string; keywords: string[]; saveJob: (id: string) => Promise<void> },
+  checkpoint?: {
+    jobId?: string;
+    keywords: string[];
+    phase?: 'no_website' | 'website_improvement';
+    saveJob: (id: string) => Promise<void>;
+    onProgress?: (msg: string) => Promise<void>;
+  },
 ): Promise<BusinessCandidate[]> {
+  const phase = checkpoint?.phase ?? 'website_improvement';
   if (config.PROVIDER_MODE === 'safe') return safeBusinesses({ ...input, name: checkpoint?.keywords[0] ?? input.name });
   if (await shouldStop?.()) return [];
 
   const scrapePool = input.maxDiscovery ? Number(input.maxDiscovery) : Math.max(input.targetCount * 2, 50);
-  const keywords = checkpoint?.keywords ?? buildDiscoveryKeywords(input);
-  const depth = mapsDepthFor(scrapePool, keywords.length);
+  const keywords = checkpoint?.keywords ?? (phase === 'no_website' ? buildNoWebsiteKeywords(input) : buildDiscoveryKeywords(input));
+  const depth = mapsDepthFor(scrapePool, keywords.length, phase);
   let jobId = checkpoint?.jobId;
   if (!jobId) {
   const response = await fetch(`${config.GMAPS_API_URL}/api/v1/jobs`, {
@@ -92,9 +99,12 @@ export async function discoverBusinesses(
     if (await shouldStop?.()) return [];
     await delay(attempt === 0 ? 2_000 : 5_000);
     if (await shouldStop?.()) return [];
+    if (attempt > 0 && attempt % 5 === 0 && checkpoint?.onProgress) {
+      await checkpoint.onProgress(`Google Maps scraping in progress: batch job ${jobId.slice(0, 8)}... (poll attempt ${attempt + 1})`).catch(() => undefined);
+    }
     let statusResponse: Response;
     try {
-      statusResponse = await fetch(`${config.GMAPS_API_URL}/api/v1/jobs/${encodeURIComponent(jobId)}`, { signal: AbortSignal.timeout(60_000) });
+      statusResponse = await fetch(`${config.GMAPS_API_URL}/api/v1/jobs/${encodeURIComponent(jobId)}`, { signal: AbortSignal.timeout(120_000) });
     } catch (pollErr) {
       console.warn(`[discoverBusinesses] Status poll attempt ${attempt + 1} timed out or failed, will retry:`, pollErr instanceof Error ? pollErr.message : String(pollErr));
       continue;
@@ -127,8 +137,64 @@ export async function discoverBusinesses(
   throw new Error(`Maps job ${jobId} did not complete within the polling window`);
 }
 
-export function mapsDepthFor(targetCount: number, keywordCount: number) {
-  return Math.min(10, Math.max(1, Math.ceil(targetCount / Math.max(keywordCount, 1) / 15)));
+export function mapsDepthFor(targetCount: number, keywordCount: number, phase: 'no_website' | 'website_improvement' = 'website_improvement') {
+  const base = Math.ceil(targetCount / Math.max(keywordCount, 1) / 15);
+  const minDepth = phase === 'no_website' ? 3 : 1;
+  return Math.min(10, Math.max(minDepth, base));
+}
+
+export function buildNoWebsiteKeywords(input: CreateRunInput): string[] {
+  const poolLimit = input.maxDiscovery ? Number(input.maxDiscovery) : Math.max(input.targetCount * 2, 50);
+  const neededBatches = Math.max(
+    input.cities.length * input.businessTypes.length * 6,
+    Math.ceil(poolLimit / 12),
+  );
+  const desired = Math.min(300, Math.max(neededBatches, 10));
+
+  const isDubai = input.cities.some((c) => /dubai/i.test(c)) || /emirates|uae/i.test(input.country);
+  const industrialZones = isDubai ? [
+    'Al Quoz Industrial Area 1', 'Al Quoz Industrial Area 2', 'Al Quoz Industrial Area 3', 'Al Quoz Industrial Area 4',
+    'Al Qusais Industrial Area 1', 'Al Qusais Industrial Area 2', 'Al Qusais Industrial Area 3', 'Al Qusais Industrial Area 4', 'Al Qusais Industrial Area 5',
+    'Ras Al Khor Industrial Area 1', 'Ras Al Khor Industrial Area 2', 'Ras Al Khor Industrial Area 3',
+    'Jebel Ali Industrial Area 1', 'Umm Ramool', 'Deira wholesale', 'Al Khabisi', 'Al Garhoud industrial',
+  ] : [
+    'Industrial Area 1', 'Industrial Area 2', 'Industrial Area 3', 'Industrial Estate', 'Phase 1 Industrial',
+    'Phase 2 Industrial', 'Warehouse District', 'Wholesale Market', 'Workshop Area', 'Old Town Market',
+    'Industrial Zone', 'SME Cluster', 'Fabrication Zone', 'Sector 1 Industrial', 'Sector 2 Industrial',
+  ];
+
+  const unDigitizedModifiers = ['workshop', 'works', 'fabrication', 'repair', 'trading', 'services', 'small', 'local', 'unit'];
+  const keywords: string[] = [];
+
+  for (const city of input.cities) {
+    for (const type of input.businessTypes) {
+      const baseType = type.replace(/\b(?:company|companies|corporation|inc|llc|manufacturer|manufacturers)\b/gi, '').trim() || type;
+
+      for (const zone of industrialZones) {
+        keywords.push(`${baseType} workshop in ${zone}, ${input.country}`);
+        keywords.push(`${baseType} in ${zone}, ${input.country}`);
+        keywords.push(`${baseType} fabrication in ${zone}, ${input.country}`);
+        keywords.push(`${baseType} trading in ${zone}, ${input.country}`);
+        if (keywords.length >= desired) return keywords;
+      }
+
+      for (const mod of unDigitizedModifiers) {
+        keywords.push(`${baseType} ${mod} in ${city}, ${input.country}`);
+        keywords.push(`local ${baseType} ${mod} near ${city}, ${input.country}`);
+        if (keywords.length >= desired) return keywords;
+      }
+    }
+  }
+
+  for (const city of input.cities) {
+    for (const type of input.businessTypes) {
+      keywords.push(`local ${type} in ${city}, ${input.country}`);
+      keywords.push(`${type} near ${city}, ${input.country}`);
+      if (keywords.length >= desired) return keywords;
+    }
+  }
+
+  return keywords;
 }
 
 export function buildDiscoveryKeywords(input: CreateRunInput) {
