@@ -23,7 +23,7 @@ const envSchema = z.object({
   CRAWL_CONCURRENCY: z.coerce.number().int().min(1).max(8).default(3),
   AI_CONCURRENCY: z.coerce.number().int().min(1).max(2).default(1),
   SEARCH_CONCURRENCY: z.coerce.number().int().min(1).max(4).default(2),
-  ENRICHMENT_CONCURRENCY: z.coerce.number().int().min(1).max(4).default(2),
+  ENRICHMENT_CONCURRENCY: z.coerce.number().int().min(1).max(8).default(2),
   CAMPAIGN_CONCURRENCY: z.coerce.number().int().min(1).max(2).default(1),
   GMAPS_API_URL: z.string().url().default('http://gmaps:8080'),
   SEARXNG_URL: z.string().url().default('http://searxng:8080'),

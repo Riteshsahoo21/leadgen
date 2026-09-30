@@ -11,13 +11,15 @@ services:
       ENABLE_EMAIL_SENDING: ${ENABLE_EMAIL_SENDING:-false}
   worker:
     cpus: 1.5
-    mem_limit: 1024m
-    memswap_limit: 1024m
+    mem_limit: 2048m
+    memswap_limit: 2048m
     environment:
+      NODE_OPTIONS: "--max-old-space-size=1536"
       CRAWL_CONCURRENCY: "5"
       AI_CONCURRENCY: "1"
-      SEARCH_CONCURRENCY: "3"
-      ENRICHMENT_CONCURRENCY: "4"
+      SEARCH_CONCURRENCY: "4"
+      ENRICHMENT_CONCURRENCY: "6"
+      MAX_PAGES_PER_SITE: "5"
       ENABLE_AI: "false"
       ENABLE_EMAIL_SENDING: ${ENABLE_EMAIL_SENDING:-false}
   postgres:

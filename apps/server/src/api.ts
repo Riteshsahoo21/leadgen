@@ -174,6 +174,8 @@ app.get<{ Params: { id: string } }>('/api/runs/:id', async (request, reply) => {
     await refreshRunStats(run.id);
     run = (await getRun(run.id)) ?? run;
   }
+  const opportunity = parsed.data.opportunity ?? null;
+  const qualified = parsed.data.qualified === undefined ? null : parsed.data.qualified === 'true';
   const companies = await pool.query(
     `SELECT c.*,q.qualified,q.score AS qualification_score,q.opportunity,q.pain_points,q.score_breakdown,
        x.full_name,x.role,e.email,e.verification_status,
@@ -195,11 +197,13 @@ app.get<{ Params: { id: string } }>('/api/runs/:id', async (request, reply) => {
        LIMIT 1
      ) e ON true
      WHERE c.run_id=$1
+       AND ($4::text IS NULL OR q.opportunity=$4)
+       AND ($5::boolean IS NULL OR q.qualified=$5)
      ORDER BY (q.qualified IS TRUE) DESC, (e.email IS NOT NULL) DESC, c.updated_at DESC, q.score DESC NULLS LAST, c.id
      LIMIT $2 OFFSET $3`,
-    [run.id, parsed.data.limit ?? 100, parsed.data.offset ?? 0],
+    [run.id, parsed.data.limit ?? 100, parsed.data.offset ?? 0, opportunity, qualified],
   );
-  return { run, companies: companies.rows, total: companies.rows[0]?.run_total ?? Number(run.stats?.discovered ?? 0) };
+  return { run, companies: companies.rows, total: companies.rows[0]?.run_total ?? 0 };
 });
 
 app.post('/api/runs', async (request, reply) => {

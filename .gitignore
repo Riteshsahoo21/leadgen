@@ -11,3 +11,6 @@ backups/*
 !backups/.gitkeep
 secrets/*
 !secrets/.gitkeep
+storage/
+apps/server/storage/
+scratch/

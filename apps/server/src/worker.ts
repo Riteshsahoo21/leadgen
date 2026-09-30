@@ -284,9 +284,18 @@ addWorker('research', async (job: Job<CompanyJob>) => {
     if (discoveredWebsite) {
       const normDomain = normalizeDomain(discoveredWebsite);
       company.website = discoveredWebsite;
-      company.domain = normDomain;
       candidate.website = discoveredWebsite;
-      await pool.query('UPDATE companies SET website=$2, domain=$3 WHERE id=$1', [company.id, discoveredWebsite, normDomain]);
+      let domainClaimed = false;
+      if (normDomain) {
+        const existing = await pool.query('SELECT id FROM companies WHERE run_id=$1 AND domain=$2 AND id<>$3 LIMIT 1', [company.run_id, normDomain, company.id]);
+        if (existing.rows.length > 0) domainClaimed = true;
+      }
+      if (normDomain && !domainClaimed) {
+        company.domain = normDomain;
+        await pool.query('UPDATE companies SET website=$2, domain=$3 WHERE id=$1', [company.id, discoveredWebsite, normDomain]);
+      } else {
+        await pool.query('UPDATE companies SET website=$2 WHERE id=$1', [company.id, discoveredWebsite]);
+      }
       await logEvent(company.run_id, 'research', `Discovered official website for ${company.name}: ${discoveredWebsite}`, company.id);
       try {
         await saveEvidence(company.id, await crawlWebsite(candidate));

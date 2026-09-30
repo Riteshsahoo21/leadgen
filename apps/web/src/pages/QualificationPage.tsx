@@ -6,11 +6,8 @@ import { Badge, EmptyState, LoadingRows, PageHeader, Panel, Score, StatCard } fr
 import { usePolling } from '../hooks/usePolling';
 
 const filters = [
-  ['all', 'All evaluated'],
-  ['actionable', 'Qualified'],
-  ['new_website', 'No website'],
-  ['website_improvement', 'Incomplete website'],
-  ['manual_review', 'Manual review'],
+  ['website_improvement', 'Websites Needing Improvement'],
+  ['new_website', 'Businesses with No Website'],
 ] as const;
 
 const emptySummary: QualificationSummary = {
@@ -22,33 +19,30 @@ export function QualificationPage() {
   const [items, setItems] = useState<Qualification[]>([]);
   const [recentlyDiscovered, setRecentlyDiscovered] = useState<Lead[]>([]);
   const [summary, setSummary] = useState<QualificationSummary>(emptySummary);
-  const [filter, setFilter] = useState<(typeof filters)[number][0]>('actionable');
+  const [filter, setFilter] = useState<(typeof filters)[number][0]>('website_improvement');
   const [page, setPage] = useState(0);
   const [total, setTotal] = useState(0);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
   usePolling(async () => {
     try {
-      const opportunity = ['new_website', 'website_improvement', 'manual_review'].includes(filter) ? filter : undefined;
-      const qualified = filter === 'actionable' ? true : undefined;
-      const value = await api<{ qualifications: Qualification[]; summary: QualificationSummary; total: number; recentlyDiscovered: Lead[] }>(`/api/qualifications${queryString({ qualified, opportunity, limit: 100, offset: page * 100 })}`);
+      const value = await api<{ qualifications: Qualification[]; summary: QualificationSummary; total: number; recentlyDiscovered: Lead[] }>(`/api/qualifications${queryString({ qualified: true, opportunity: filter, limit: 100, offset: page * 100 })}`);
       setItems(value.qualifications); setRecentlyDiscovered(value.recentlyDiscovered); setTotal(value.total); setSummary(value.summary); setError('');
     } catch (reason) { setError(reason instanceof Error ? reason.message : String(reason)); }
     finally { setLoading(false); }
   }, 2_500, `${filter}:${page}`);
   return <>
-    <PageHeader eyebrow="LEAD PRIORITIZATION" title="Qualification" description="Qualified leads need a new website or improvements supported by collected evidence. Higher outreach-priority scores mean stronger opportunities—not better websites. AI adds explanations without blocking the pipeline." />
-    <section className="stats-grid stats-grid-three">
-      <StatCard label="Evaluated" value={summary.evaluated} note={`${summary.qualified} qualified · ${summary.not_qualified} not selected`} icon={BrainCircuit} />
-      <StatCard label="Qualified leads" value={summary.qualified} note={`${summary.new_website} no website · ${summary.website_improvement} incomplete`} icon={CheckCircle2} tone="green" />
-      <StatCard label="AI explanations" value={summary.ai_explained} note={`${summary.ai_pending} pending · ${summary.ai_fallback} rules fallback`} icon={Gauge} tone="violet" />
+    <PageHeader eyebrow="QUALIFIED OUTREACH LEADS" title="Qualified Opportunities" description="Actionable high-priority prospects categorized into businesses needing modern website upgrades and businesses with no web presence." />
+    <section className="stats-grid stats-grid-two">
+      <StatCard label="Websites Needing Improvement" value={summary.website_improvement} note="Active businesses with outdated/incomplete web presence" icon={BrainCircuit} tone="cyan" />
+      <StatCard label="Businesses with No Website" value={summary.new_website} note="High-traction businesses needing a ground-floor website build" icon={CheckCircle2} tone="green" />
     </section>
     <Panel title="Recently discovered" subtitle="New Maps results appear here while website checks and qualification run.">
       <div className="table-wrap"><table><thead><tr><th>Business</th><th>Location</th><th>Website</th><th>Stage</th></tr></thead>
         <tbody>{recentlyDiscovered.map((lead) => <tr key={lead.id}><td><Link className="table-title" to={`/businesses/${lead.id}`}>{lead.name}</Link></td><td>{lead.city ?? lead.country}</td><td>{lead.website ? 'Checking website' : 'No website listed'}</td><td><Badge value={lead.status} /></td></tr>)}</tbody>
       </table>{!recentlyDiscovered.length && <p className="run-progress">No businesses are awaiting evaluation.</p>}</div>
     </Panel>
-    <Panel title="Ranked qualification results" subtitle="Higher score = stronger outreach opportunity. Filter by no website or improvement needs." action={<div className="segmented">{filters.map(([value, label]) => <button key={value} className={filter === value ? 'active' : ''} onClick={() => { setPage(0); setFilter(value); }}>{label}</button>)}</div>}>
+    <Panel title="Qualified prospects" subtitle="Ranked by outreach priority and capability evidence." action={<div className="segmented">{filters.map(([value, label]) => <button key={value} className={filter === value ? 'active' : ''} onClick={() => { setPage(0); setFilter(value); }}>{label}</button>)}</div>}>
       {error && <div className="alert">{error}</div>}
       <div className="qualification-list">{items.map((item) => {
         const breakdown = item.score_breakdown ?? {};

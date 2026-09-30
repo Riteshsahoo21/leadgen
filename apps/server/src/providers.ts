@@ -16,6 +16,16 @@ try {
   }
 } catch { /* ignore DNS server override error */ }
 
+const globalMxCache = new Map<string, { mx: Awaited<ReturnType<typeof dns.resolveMx>> | undefined; timestamp: number }>();
+const MX_CACHE_TTL_MS = 10 * 60 * 1000; // 10 minutes
+
+const sharedCrawleeConfig = new Configuration({
+  persistStorage: false,
+  purgeOnStart: true,
+  memoryMbytes: 1536,
+  availableMemoryRatio: 0.95,
+});
+
 const serviceWords = ['Studio', 'Works', 'Collective', 'Partners', 'Solutions', 'House', 'Company'];
 
 export function safeBusinesses(input: CreateRunInput): BusinessCandidate[] {
@@ -259,13 +269,6 @@ export async function crawlWebsite(candidate: BusinessCandidate): Promise<Websit
 
   const root = new URL(candidate.website.includes('://') ? candidate.website : `https://${candidate.website}`);
   const documents: Array<{ url: string; html: string }> = [];
-  const crawleeConfig = new Configuration({
-    persistStorage: false,
-    purgeOnStart: true,
-    memoryMbytes: 1024,
-    availableMemoryRatio: 0.95,
-  });
-
   const runCheerioCrawl = async (startUrl: string) => {
     const crawler = new CheerioCrawler({
       maxRequestsPerCrawl: config.MAX_PAGES_PER_SITE,
@@ -274,36 +277,48 @@ export async function crawlWebsite(candidate: BusinessCandidate): Promise<Websit
       requestHandlerTimeoutSecs: 10,
       maxRequestRetries: 0,
       async requestHandler({ $, request, enqueueLinks }) {
-        const html = $.html();
+        const html = $.html().slice(0, 500_000);
         const finalUrl = request.loadedUrl || request.url;
         documents.push({ url: finalUrl, html });
-        await enqueueLinks({
-          strategy: 'same-domain',
-          transformRequestFunction(req) {
-            try {
-              const u = new URL(req.url);
-              u.hash = '';
-              u.search = '';
-              if (/\.(?:pdf|docx?|xlsx?|pptx?|zip|rar|tar|gz|mp4|mp3|avi|png|jpe?g|gif|webp|svg|ico|css|js|woff2?|xml|json|txt)$/i.test(u.pathname)) {
+
+        const hasEmail = documents.some(d => /mailto:|[\w.-]+@[\w.-]+\.[a-z]{2,}/i.test(d.html));
+        const hasForm = documents.some(d => /<form/i.test(d.html) && /contact|enquir|message|quote|rfq|email|phone/i.test(d.html));
+
+        // Early-exit optimization: if we have 2+ pages and already found both an email
+        // and an enquiry/contact form, we have sufficient actionable evidence.
+        if (documents.length >= 2 && hasEmail && hasForm) {
+          return;
+        }
+
+        if (documents.length < 5) {
+          await enqueueLinks({
+            strategy: 'same-domain',
+            transformRequestFunction(req) {
+              try {
+                const u = new URL(req.url);
+                u.hash = '';
+                u.search = '';
+                if (/\.(?:pdf|docx?|xlsx?|pptx?|zip|rar|tar|gz|mp4|mp3|avi|png|jpe?g|gif|webp|svg|ico|css|js|woff2?|xml|json|txt)$/i.test(u.pathname)) {
+                  return false;
+                }
+                req.url = u.toString();
+                const priority = pagePriority(req.url);
+                req.userData = { priority };
+                if (priority >= 60) {
+                  (req as any).forefront = true;
+                }
+                return req;
+              } catch {
                 return false;
               }
-              req.url = u.toString();
-              const priority = pagePriority(req.url);
-              req.userData = { priority };
-              if (priority >= 60) {
-                (req as any).forefront = true;
-              }
-              return req;
-            } catch {
-              return false;
-            }
-          },
-        });
+            },
+          });
+        }
       },
       async failedRequestHandler({ request }, error) {
         // Individual subpage failures should not abort the site crawl
       },
-    }, crawleeConfig);
+    }, sharedCrawleeConfig);
 
     await crawler.run([startUrl]);
   };
@@ -328,7 +343,7 @@ export async function crawlWebsite(candidate: BusinessCandidate): Promise<Websit
 
   if (!hasBotProtection && looksLikeJavascriptShell) {
     try {
-      const rendered = await renderWithPlaywright(root.toString(), crawleeConfig);
+      const rendered = await renderWithPlaywright(root.toString(), sharedCrawleeConfig);
       if (rendered) {
         const merged = [...documents.slice(1), { url: root.toString(), html: rendered }];
         evidence = extractEvidence(merged, candidate);
@@ -1015,7 +1030,6 @@ export async function enrichEmails(candidate: BusinessCandidate, fullName: strin
     }
   }
   const results: Array<{ address: string; status: string; method: string; confidence: number; evidence: Record<string, unknown> }> = [];
-  const mxCache = new Map<string, Awaited<ReturnType<typeof dns.resolveMx>> | undefined>();
   for (const source of [...candidates.values()].slice(0, 12)) {
     const address = source.value;
     const addressDomain = address.split('@')[1]?.toLowerCase();
@@ -1029,8 +1043,19 @@ export async function enrichEmails(candidate: BusinessCandidate, fullName: strin
       continue;
     }
     try {
-      let mx = mxCache.get(addressDomain);
-      if (!mxCache.has(addressDomain)) { mx = await dns.resolveMx(addressDomain); mxCache.set(addressDomain, mx); }
+      const cached = globalMxCache.get(addressDomain);
+      let mx: Awaited<ReturnType<typeof dns.resolveMx>> | undefined;
+      if (cached && Date.now() - cached.timestamp < MX_CACHE_TTL_MS) {
+        mx = cached.mx;
+      } else {
+        try {
+          mx = await dns.resolveMx(addressDomain);
+          globalMxCache.set(addressDomain, { mx, timestamp: Date.now() });
+        } catch {
+          globalMxCache.set(addressDomain, { mx: undefined, timestamp: Date.now() });
+          mx = undefined;
+        }
+      }
       if (!mx?.length) {
         results.push({ address, status: 'invalid', method: 'dns_mx', confidence: 95, evidence: { ...source, reason: 'No MX records' } });
         continue;
@@ -1141,7 +1166,7 @@ export async function sendWithPosta(to: string, subject: string, body: string) {
 
 async function searchPublicWeb(query: string): Promise<PublicSearchResult[]> {
   try {
-    const response = await fetch(`${config.SEARXNG_URL}/search?format=json&engines=bing,yahoo&q=${encodeURIComponent(query)}`, { signal: AbortSignal.timeout(20_000) });
+    const response = await fetch(`${config.SEARXNG_URL}/search?format=json&engines=bing,yahoo&q=${encodeURIComponent(query)}`, { signal: AbortSignal.timeout(7_000) });
     if (!response.ok) {
       console.warn(`[searchPublicWeb] SearXNG HTTP ${response.status} for query: ${query.slice(0, 60)}`);
       return [];
