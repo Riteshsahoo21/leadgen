@@ -107,6 +107,7 @@ export function calculateQualificationScore(candidate: BusinessCandidate, eviden
   const category = `${candidate.category ?? ''} ${(candidate.categories ?? []).join(' ')}`;
   const bookingRelevant = /dentist|clinic|doctor|salon|spa|hotel|restaurant|repair|fitness/i.test(category);
   const commerceRelevant = /retail|store|shop|e-?commerce|clothing|garment|delivery/i.test(category);
+  const b2bRelevant = /manufactur|industrial|machinery|factory|equipment|supplier|packaging|metal|fabricat|chemical|wholesal|distribut/i.test(category);
   const painPoints: string[] = [];
   const signals: string[] = [];
   let opportunity = 'website_present';
@@ -146,18 +147,23 @@ export function calculateQualificationScore(candidate: BusinessCandidate, eviden
       painPoint: 'Website lacks a responsive viewport meta tag (not mobile-friendly)',
       signal: 'Site is not optimized for smartphone traffic',
     });
-    if (evidence.isOutdated === true && !evidence.hasContactForm && !evidence.hasBooking && !evidence.hasPayment) gaps.push({
+    if (evidence.isOutdated === true && !(evidence.hasContactForm && (evidence.hasBooking || evidence.hasPayment))) gaps.push({
       points: 12,
       painPoint: 'Website layout, copyright, or structure appears outdated',
       signal: 'Site appears stale and unmaintained',
     });
     const hasConversionPath = Boolean(evidence.hasContactForm || evidence.hasBooking || evidence.hasPayment);
-    if (pagesCrawled === 1 && !hasConversionPath) gaps.push({
+    if (pagesCrawled <= 2 && !hasConversionPath) gaps.push({
       points: 18,
-      painPoint: 'Only a landing page with no detected enquiry, booking, or purchase flow was checked',
-      signal: 'Single-page site exposes no detected conversion path',
+      painPoint: `Thin site (${pagesCrawled} checked page${pagesCrawled === 1 ? '' : 's'}) with no detected enquiry, booking, or RFQ flow`,
+      signal: 'Website has no detected digital conversion path for new clients',
     });
-    if (evidence.hasContactForm === false && !evidence.hasBooking && !evidence.hasPayment && !evidence.publicEmails && !evidence.publicPhones && !candidate.phone && pagesCrawled > 1) gaps.push({
+    if (b2bRelevant && evidence.hasContactForm === false && evidence.hasPayment === false) gaps.push({
+      points: 15,
+      painPoint: `No online RFQ or quotation enquiry form detected on ${pagesCrawled} checked page${pagesCrawled === 1 ? '' : 's'}`,
+      signal: 'Industrial and B2B buyers cannot submit digital RFQs or quote requests',
+    });
+    if (evidence.hasContactForm === false && !evidence.hasBooking && !evidence.hasPayment && !evidence.publicEmails && !evidence.publicPhones && !candidate.phone && pagesCrawled > 2) gaps.push({
       points: 12,
       painPoint: `No contact form detected on ${pagesCrawled} checked page${pagesCrawled === 1 ? '' : 's'}`,
       signal: 'No direct website enquiry form was detected',

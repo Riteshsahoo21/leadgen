@@ -10,14 +10,14 @@ services:
       ENABLE_AI: "false"
       ENABLE_EMAIL_SENDING: ${ENABLE_EMAIL_SENDING:-false}
   worker:
-    cpus: 1.0
+    cpus: 1.5
     mem_limit: 1024m
     memswap_limit: 1024m
     environment:
-      CRAWL_CONCURRENCY: "1"
+      CRAWL_CONCURRENCY: "5"
       AI_CONCURRENCY: "1"
-      SEARCH_CONCURRENCY: "1"
-      ENRICHMENT_CONCURRENCY: "1"
+      SEARCH_CONCURRENCY: "3"
+      ENRICHMENT_CONCURRENCY: "4"
       ENABLE_AI: "false"
       ENABLE_EMAIL_SENDING: ${ENABLE_EMAIL_SENDING:-false}
   postgres:

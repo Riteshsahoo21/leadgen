@@ -270,14 +270,15 @@ export async function crawlWebsite(candidate: BusinessCandidate): Promise<Websit
     const crawler = new CheerioCrawler({
       maxRequestsPerCrawl: config.MAX_PAGES_PER_SITE,
       maxConcurrency: 3,
-      requestHandlerTimeoutSecs: 15,
-      maxRequestRetries: 1,
+      navigationTimeoutSecs: 10,
+      requestHandlerTimeoutSecs: 10,
+      maxRequestRetries: 0,
       async requestHandler({ $, request, enqueueLinks }) {
         const html = $.html();
         const finalUrl = request.loadedUrl || request.url;
         documents.push({ url: finalUrl, html });
         await enqueueLinks({
-          strategy: 'same-hostname',
+          strategy: 'same-domain',
           transformRequestFunction(req) {
             try {
               const u = new URL(req.url);
@@ -321,9 +322,11 @@ export async function crawlWebsite(candidate: BusinessCandidate): Promise<Websit
 
   let evidence = documents.length ? extractEvidence(documents, candidate) : undefined;
   const hasBotProtection = evidence?.crawlBlocked === true;
-  const looksLikeJavascriptShell = documents.some(({ html }) => /<script[^>]+(?:src=|type=['"']module)/i.test(html)) && (!evidence || evidence.textSample.length < 120);
+  const looksLikeJavascriptShell = documents.length > 0 &&
+    documents.some(({ html }) => /<script[^>]+(?:src=|type=['"']module)/i.test(html)) &&
+    (!evidence || evidence.textSample.length < 120);
 
-  if (!hasBotProtection && (!evidence || looksLikeJavascriptShell)) {
+  if (!hasBotProtection && looksLikeJavascriptShell) {
     try {
       const rendered = await renderWithPlaywright(root.toString(), crawleeConfig);
       if (rendered) {

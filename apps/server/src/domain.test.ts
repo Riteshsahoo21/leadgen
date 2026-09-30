@@ -83,6 +83,17 @@ describe('comparative qualification scoring', () => {
     expect(modernSite.opportunity).toBe('website_present');
     expect(modernSite.score).toBeLessThan(50);
   });
+
+  it('qualifies manufacturing businesses lacking RFQ / quotation forms as website_improvement', () => {
+    const manufacturer = { ...base, category: 'Packaging manufacturer', website: 'https://packaging.test' };
+    const result = calculateQualificationScore(manufacturer, {
+      pagesCrawled: 5, hasSsl: true, hasViewport: true,
+      hasContactForm: false, hasBooking: false, hasPayment: false, publicPhones: 1, publicEmails: 1,
+    });
+    expect(result.opportunity).toBe('website_improvement');
+    expect(result.score).toBeGreaterThanOrEqual(60);
+    expect(result.painPoints.some((p) => p.includes('RFQ') || p.includes('quotation'))).toBe(true);
+  });
 });
 
 describe('lead normalization and filtering', () => {
