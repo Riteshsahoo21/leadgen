@@ -109,4 +109,56 @@ describe('public contact extraction', () => {
     expect(extractEmails('info.construction@concor.co.zamore')).toEqual(['info.construction@concor.co.za']);
     expect(extractEmails('care@pharmeasy.inphone')).toEqual(['care@pharmeasy.in']);
   });
+
+  it('generates pattern emails for decision maker when domain has MX records in safe mode', async () => {
+    config.PROVIDER_MODE = 'safe';
+    const candidate = { name: 'Atlas Manufacturing', country: 'UAE', website: 'https://atlas-mfg.ae' };
+    const emails = await enrichEmails(candidate, 'Rashid Al Maktoum', []);
+    expect(emails.length).toBeGreaterThan(0);
+    const addresses = emails.map((e) => e.address);
+    expect(addresses).toContain('rashid.maktoum@atlas-mfg.ae');
+    expect(addresses).toContain('info@atlas-mfg.ae');
+  });
+
+  it('enqueues both keyword and general subpages in Crawlee CheerioCrawler', async () => {
+    config.PROVIDER_MODE = 'live';
+    const enqueued: any[] = [];
+    vi.spyOn(CheerioCrawler.prototype, 'run').mockImplementation(async function (this: any, requests: any) {
+      const url = String(requests?.[0] ?? '');
+      const $ = load(`
+        <html>
+          <head><title>Apex Steel</title></head>
+          <body>
+            <a href="/about-us">About</a>
+            <a href="/manufacturing-facility">Our Plant</a>
+            <a href="/products/rebar">Rebar</a>
+            <a href="/contact">Contact</a>
+            <a href="/catalog.pdf">Download PDF</a>
+          </body>
+        </html>
+      `);
+      const request = { url, loadedUrl: url };
+      await (this as any).requestHandler({
+        $,
+        request,
+        enqueueLinks: async (options: any) => {
+          const links = ['https://apexsteel.ae/about-us', 'https://apexsteel.ae/manufacturing-facility', 'https://apexsteel.ae/products/rebar', 'https://apexsteel.ae/contact', 'https://apexsteel.ae/catalog.pdf'];
+          for (const link of links) {
+            const transformed = options.transformRequestFunction({ url: link });
+            if (transformed) enqueued.push(transformed);
+          }
+        },
+      });
+    });
+
+    const evidence = await crawlWebsite({ name: 'Apex Steel', country: 'UAE', website: 'https://apexsteel.ae' });
+    expect(evidence.title).toBe('Apex Steel');
+    expect(enqueued.length).toBe(4); // 4 valid HTML subpages, catalog.pdf excluded
+    const urls = enqueued.map((req) => req.url);
+    expect(urls).toContain('https://apexsteel.ae/about-us');
+    expect(urls).toContain('https://apexsteel.ae/manufacturing-facility');
+    expect(urls).toContain('https://apexsteel.ae/products/rebar');
+    expect(urls).toContain('https://apexsteel.ae/contact');
+    expect(urls).not.toContain('https://apexsteel.ae/catalog.pdf');
+  });
 });

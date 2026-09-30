@@ -981,6 +981,32 @@ export async function enrichEmails(candidate: BusinessCandidate, fullName: strin
       ...(candidate.website ? { sourceUrl: candidate.website } : {}),
     });
   }
+  if (domain && !/(?:gmail|yahoo|hotmail|outlook|proton|zoho)\./i.test(domain)) {
+    const tokens = fullName.toLowerCase().replace(/[^a-z\s]/g, '').split(/\s+/).filter(Boolean);
+    const first = tokens[0];
+    const last = tokens.at(-1);
+    const patterns: string[] = [];
+    if (first && last && first !== last && tokens.length >= 2) {
+      patterns.push(`${first}.${last}@${domain}`);
+      patterns.push(`${first}@${domain}`);
+      patterns.push(`${first[0]}${last}@${domain}`);
+    } else if (first && first.length >= 2) {
+      patterns.push(`${first}@${domain}`);
+    }
+    patterns.push(`info@${domain}`);
+    patterns.push(`contact@${domain}`);
+    for (const pat of patterns) {
+      const normalized = normalizeEmail(pat);
+      if (normalized && !candidates.has(normalized)) {
+        candidates.set(normalized, {
+          kind: 'email',
+          value: normalized,
+          sourceType: 'generated_pattern',
+          ...(candidate.website ? { sourceUrl: candidate.website } : {}),
+        });
+      }
+    }
+  }
   const results: Array<{ address: string; status: string; method: string; confidence: number; evidence: Record<string, unknown> }> = [];
   const mxCache = new Map<string, Awaited<ReturnType<typeof dns.resolveMx>> | undefined>();
   for (const source of [...candidates.values()].slice(0, 12)) {
