@@ -83,7 +83,6 @@ export async function discoverBusinesses(
       depth,
       email: false,
       max_time: 120,
-      fast_mode: true,
       max_results: Math.min(scrapePool, config.MAX_DISCOVERY_RESULTS),
     }),
     signal: AbortSignal.timeout(30_000),
