@@ -321,14 +321,18 @@ export async function refreshRunStats(runId: string) {
        'deferred_website', (SELECT count(*) FROM companies c WHERE c.run_id=r.id AND c.status='deferred_has_website'),
        'contacts', (SELECT count(DISTINCT x.company_id) FROM contacts x JOIN companies c ON c.id=x.company_id WHERE c.run_id=r.id),
        'verified', (SELECT count(DISTINCT e.company_id) FROM contact_emails e JOIN companies c ON c.id=e.company_id WHERE c.run_id=r.id AND e.verification_status='valid'),
-       'pending', (SELECT count(*) FROM companies c WHERE c.run_id=r.id AND NOT (c.status = ANY($2::text[]))),
+       'pending', (SELECT count(*) FROM companies c WHERE c.run_id=r.id AND c.status != 'deferred_has_website' AND NOT (c.status = ANY($2::text[]))),
        'finished', (SELECT count(*) FROM companies c WHERE c.run_id=r.id AND c.status = ANY($2::text[])),
        'contacted', (SELECT count(*) FROM messages m WHERE m.run_id=r.id AND m.direction='outbound' AND m.status IN ('sent','delivered')),
+       'active_crawling', (SELECT count(*) FROM companies c WHERE c.run_id=r.id AND c.status IN ('crawl_queued', 'crawling')),
+       'active_qualifying', (SELECT count(*) FROM companies c WHERE c.run_id=r.id AND c.status IN ('qualify_queued', 'qualifying')),
+       'active_researching', (SELECT count(*) FROM companies c WHERE c.run_id=r.id AND c.status IN ('research_queued', 'researching')),
+       'active_enriching', (SELECT count(*) FROM companies c WHERE c.run_id=r.id AND c.status IN ('enrich_queued', 'enriching')),
        'discovery_active', (r.status = 'running' AND r.discovery_finished_at IS NULL),
        'discovery_phase', COALESCE(r.discovery_state->>'phase', 'no_website'),
        'discovery_batch', COALESCE((r.discovery_state->>'cursor')::int, 0)
      ) WHERE r.id=$1`,
-    [runId, terminalCompanyStatuses],
+     [runId, terminalCompanyStatuses],
   );
 }
 

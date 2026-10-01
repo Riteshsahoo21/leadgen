@@ -32,11 +32,16 @@ export function RunDetailPage() {
       {formatNumber(run.stats.qualified)} / {formatNumber(run.target_count)} qualified leads
       {' '}({formatNumber(run.stats.no_website ?? 0)} / {Math.ceil(run.target_count * 0.6)} without a website [Phase 1: 60%];
       {' '}{formatNumber(run.stats.incomplete_website ?? 0)} / {run.target_count - Math.ceil(run.target_count * 0.6)} needing website improvements [Phase 2: 40%]).
-      {' '}{formatNumber(run.stats.discovered)} businesses discovered; {run.stats.pending ?? 0} processing in queue.
-      {Boolean(run.stats.deferred_website) && <> ({run.stats.deferred_website} websites deferred for Phase 2).</>}
+      {' '}{formatNumber(run.stats.discovered)} businesses discovered; {run.stats.pending ?? 0} actively processing.
+      {Boolean(run.stats.deferred_website) && <> ({run.stats.deferred_website} websites on hold).</>}
       {run.status === 'running' && !run.discovery_finished_at && state?.keywords && (
         <span style={{ display: 'inline-block', marginLeft: '0.5rem', color: '#0ea5e9', fontWeight: 600 }}>
-          ● Scraping Google Maps: Batch {state.cursor ?? 0} / {state.keywords.length} ({state.phase === 'no_website' ? 'Phase 1: No-Website' : 'Phase 2: Website Improvement'})...
+          ● Scraping Google Maps: Batch {state.cursor ?? 0} / {state.keywords.length} (Fast Mode)...
+        </span>
+      )}
+      {Boolean((run.stats.active_crawling || run.stats.active_researching || run.stats.active_enriching)) && (
+        <span style={{ display: 'inline-block', marginLeft: '0.5rem', color: '#10b981', fontWeight: 600 }}>
+          [Active: {run.stats.active_crawling ?? 0} Crawling, {run.stats.active_researching ?? 0} Researching, {run.stats.active_enriching ?? 0} Enriching]
         </span>
       )}
       {state?.reason === 'search_plan_exhausted' && <> Search coverage exhausted below target. Add more cities or categories for additional unique results.</>}

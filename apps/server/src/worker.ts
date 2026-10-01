@@ -120,6 +120,12 @@ addWorker('discovery', async (job: Job<RunJob>) => {
         await logEvent(run.id, 'discovery',
           `Phase 1 completed: ${oppCounts.noWebsite}/${noWebsiteTarget} businesses without a website found. Transitioning to Phase 2: Websites Needing Improvement.`);
 
+        if (oppCounts.incomplete >= incompleteTarget) {
+          await logEvent(run.id, 'discovery',
+            `Target quota reached (${oppCounts.noWebsite} without website, ${oppCounts.incomplete} website improvements). Discovery finished.`);
+          break;
+        }
+
         // Unfreeze deferred companies with websites collected during Phase 1
         const deferred = await pool.query<{ id: string }>(
           "SELECT id FROM companies WHERE run_id=$1 AND status='deferred_has_website'", [run.id]
@@ -147,7 +153,7 @@ addWorker('discovery', async (job: Job<RunJob>) => {
       }
     }
 
-    const searchKeywords = keywords.slice(cursor, cursor + 3);
+    const searchKeywords = keywords.slice(cursor, cursor + 4);
     if (!searchKeywords.length) break;
 
     const phaseLabel = phase === 'no_website' ? 'Phase 1: No-Website' : 'Phase 2: Website Improvement';
@@ -157,7 +163,7 @@ addWorker('discovery', async (job: Job<RunJob>) => {
 
     try {
       const businesses = await discoverBusinesses(
-        { ...input, maxDiscovery: Math.max(30, Math.min(90, Math.ceil((input.targetCount - qualifiedCount) * 2))) },
+        { ...input, maxDiscovery: Math.max(40, Math.min(120, Math.ceil((input.targetCount - qualifiedCount) * 2))) },
         () => isRunCancelled(run.id),
         {
           keywords: searchKeywords,
@@ -176,17 +182,32 @@ addWorker('discovery', async (job: Job<RunJob>) => {
 
         if (phase === 'no_website') {
           if (!hasWebsite) {
+            const currentOpp = await getOpportunityCounts();
+            if (currentOpp.noWebsite < noWebsiteTarget) {
+              const company = await insertCompany(run.id, business, 'discovered');
+              if (company.status === 'discovered') {
+                await enqueue('filter', 'filter-company', { runId: run.id, companyId: company.id }, `filter:${company.id}`);
+              }
+            }
+          } else {
+            // Interleaved: If under the 40% cap, crawl & qualify immediately!
+            const currentOpp = await getOpportunityCounts();
+            if (currentOpp.incomplete < incompleteTarget) {
+              const company = await insertCompany(run.id, business, 'discovered');
+              if (company.status === 'discovered') {
+                await enqueue('filter', 'filter-company', { runId: run.id, companyId: company.id }, `filter:${company.id}`);
+              }
+            } else {
+              await insertCompany(run.id, business, 'deferred_has_website');
+            }
+          }
+        } else {
+          const currentOpp = await getOpportunityCounts();
+          if (currentOpp.incomplete < incompleteTarget) {
             const company = await insertCompany(run.id, business, 'discovered');
             if (company.status === 'discovered') {
               await enqueue('filter', 'filter-company', { runId: run.id, companyId: company.id }, `filter:${company.id}`);
             }
-          } else {
-            await insertCompany(run.id, business, 'deferred_has_website');
-          }
-        } else {
-          const company = await insertCompany(run.id, business, 'discovered');
-          if (company.status === 'discovered') {
-            await enqueue('filter', 'filter-company', { runId: run.id, companyId: company.id }, `filter:${company.id}`);
           }
         }
         await maybeRefresh(run.id);

@@ -32,7 +32,7 @@ describe('bounded Maps jobs and resumable checkpoints', () => {
     const result = discoverBusinesses(input, async () => false, { keywords: ['dentist in Mumbai, India'], saveJob });
     await vi.advanceTimersByTimeAsync(10_000);
     expect(await result).toMatchObject([{ sourceId: 'place1', phone: '+919999999999', publicEmails: ['owner@example.org'] }]);
-    expect(JSON.parse(fetchMock.mock.calls[0]![1].body)).toMatchObject({ depth: 10, max_time: 60, email: false, keywords: ['dentist in Mumbai, India'] });
+    expect(JSON.parse(fetchMock.mock.calls[0]![1].body)).toMatchObject({ depth: 10, max_time: 120, fast_mode: true, email: false, keywords: ['dentist in Mumbai, India'] });
     expect(saveJob).toHaveBeenCalledExactlyOnceWith('maps-checkpoint');
   });
   it('resumes polling a saved job without submitting a duplicate Maps request', async () => {

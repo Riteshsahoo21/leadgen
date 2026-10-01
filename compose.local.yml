@@ -32,7 +32,7 @@ services:
     cpus: 2.0
     mem_limit: 1536m
     memswap_limit: 1536m
-    command: ["-web", "-addr", ":8080", "-data-folder", "/gmapsdata", "-c", "3", "-browser-pool-size", "1", "-pages-per-browser", "3"]
+    command: ["-web", "-addr", ":8080", "-data-folder", "/gmapsdata", "-c", "4", "-browser-pool-size", "2", "-pages-per-browser", "2", "-fast-mode"]
     volumes: !override
       - gmaps_data:/gmapsdata
     # Direct local IP; proxy credentials are not mounted.

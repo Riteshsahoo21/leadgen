@@ -16,6 +16,10 @@ export type RunStats = {
   verified: number;
   pending?: number;
   finished?: number;
+  active_crawling?: number;
+  active_qualifying?: number;
+  active_researching?: number;
+  active_enriching?: number;
   contacted: number;
 };
 
